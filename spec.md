@@ -34,11 +34,12 @@ Managing meals for two people with different preferences and goals is a recurrin
 - Meals must satisfy both people — either a shared dish or a split order
 - Goals may differ (e.g., high protein for one, lighter meals for the other)
 
-### 2. Cook Calendar
-- Cook has a weekly schedule with known leave days
-- On cook-off days, agent automatically switches to "order mode"
-- Cook's weekly menu (when known) is factored in to avoid duplicating cuisines or dishes
-- Agent handles hybrid days (cook does lunch, agent plans dinner)
+### 2. Cook Schedule (Conversational)
+- Cook leaves are communicated ad-hoc via chat ("cook is off tomorrow", "didi is on leave today") — no calendar maintenance required
+- Agent stores the leave against the affected day and automatically switches to order mode for that day's relevant meals
+- Matches how Indian households actually manage cooks — leaves are usually known same-day or a day prior, not weeks in advance
+- Agent can prompt proactively if it hasn't heard about cook status in a while ("any cook updates I should know about?")
+- Hybrid days (cook does lunch, agent plans dinner) supported through the same chat-based input
 
 ### 3. Grocery & Pantry Intelligence
 - Pantry state is tracked — agent knows what's already at home
@@ -114,8 +115,7 @@ The biggest differentiator from standard meal planners. Rather than surfacing ev
 
 | Input | Frequency | Source |
 |-------|-----------|--------|
-| Cook's leave schedule | Weekly / on change | Kriti or partner |
-| Cook's planned menu | Weekly (optional) | Kriti |
+| Cook's leave (per occurrence) | Ad-hoc via chat | Either user, when known |
 | Pantry state | On grocery run / photo | Kriti or Instamart order history |
 | Individual preferences/goals | One-time setup, updatable | Both users |
 | Monthly food budget | One-time setup | Kriti |
