@@ -1,8 +1,11 @@
 import os
 import json
 from anthropic import Anthropic
+from dotenv import load_dotenv
 
 import db
+
+load_dotenv()
 
 client = Anthropic()
 MODEL = "claude-sonnet-4-6"
