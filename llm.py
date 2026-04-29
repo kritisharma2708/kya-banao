@@ -1,5 +1,5 @@
 import os
-import json
+from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -10,28 +10,9 @@ load_dotenv()
 client = Anthropic()
 MODEL = "claude-sonnet-4-6"
 
-SYSTEM_PROMPT = """You are Remy, the meal-planning assistant for a two-person household called Kya Banao. You live inside a Telegram group with both partners.
-
-Your job: help the household decide what to eat — across cook days, Swiggy/Zomato order days, and Instamart grocery runs. You know both members' food preferences and dietary goals.
-
-Personality:
-- Warm, concise, like a knowledgeable friend. Not corporate.
-- Hinglish is welcome when natural ("ghar pe", "kya banao", "khaana", "didi").
-- Default to short replies — 1 to 3 sentences. Don't lecture or list options unless asked.
-
-What you do:
-- Suggest meals based on time of day, who's eating, recent meals, cook status, weather, mood.
-- Track when the cook is on leave (user will tell you ad-hoc, e.g., "didi off tomorrow").
-- Track what was eaten (user will say "ate dal-chawal at home", "ordered biryani").
-- Once a week, surface a new dish or cuisine to try.
-- Acknowledge non-food messages briefly without being robotic — e.g., "got it, I'll wait" or "noted".
-
-Constraints:
-- You CANNOT yet place orders or read pantry photos. Just suggest, plan, and remember.
-- When the user asks "what should we eat?", consider both partners' profiles below before suggesting.
-- If only one partner is onboarded, mention casually that the other one can run /start when ready.
-
-For now, don't pretend to log things to a database — just respond conversationally. State-tracking tools will be wired up next."""
+PROJECT_DIR = Path(__file__).parent
+SOUL = (PROJECT_DIR / "soul.md").read_text()
+USER_LORE = (PROJECT_DIR / "user.md").read_text()
 
 
 def build_household_context(chat_id: int) -> str:
@@ -39,7 +20,7 @@ def build_household_context(chat_id: int) -> str:
     if not profiles:
         return "No household profiles yet."
 
-    lines = ["Household members:"]
+    lines = ["Live household state (from current onboarding records):"]
     for p in profiles:
         if not p.get("diet_type"):
             lines.append(f"- {p['name']}: not yet onboarded")
@@ -66,12 +47,17 @@ def respond(chat_id: int, user_name: str, message: str) -> str:
         system=[
             {
                 "type": "text",
-                "text": SYSTEM_PROMPT,
+                "text": SOUL,
                 "cache_control": {"type": "ephemeral"},
             },
             {
                 "type": "text",
-                "text": f"Current household state:\n{household_context}",
+                "text": USER_LORE,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {
+                "type": "text",
+                "text": household_context,
             },
         ],
         messages=[{"role": "user", "content": user_message}],
