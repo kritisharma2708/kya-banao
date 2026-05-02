@@ -5,6 +5,7 @@ from datetime import datetime
 from contextlib import contextmanager
 
 DB_PATH = os.getenv("DATABASE_URL", "kya_banao.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True) if os.path.dirname(DB_PATH) else None
 
 
 @contextmanager
