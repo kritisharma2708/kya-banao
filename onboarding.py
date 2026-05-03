@@ -30,9 +30,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data["profile"] = {"name": user.first_name}
     await update.message.reply_text(
-        f"Hey {user.first_name}, I'm Remy — kitchen-spirit of this group.\n\n"
+        f"Hey {user.first_name}, I'm Remy, kitchen-spirit of this group.\n\n"
         "A few quick questions so I can learn your food rhythms. Your partner should run /start too whenever they're around.\n\n"
-        "First — what's your diet?",
+        "First, what's your diet?",
         reply_markup=ReplyKeyboardMarkup(DIET_OPTIONS, one_time_keyboard=True, resize_keyboard=True),
     )
     return DIET
@@ -42,7 +42,7 @@ async def diet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["profile"]["diet_type"] = update.message.text.strip()
     await update.message.reply_text(
         "Any allergies or things you absolutely can't eat? "
-        "(e.g., 'lactose, peanuts' — or send 'none')",
+        "(e.g., 'lactose, peanuts', or send 'none')",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ALLERGIES
@@ -53,7 +53,7 @@ async def allergies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["profile"]["allergies"] = "" if text.lower() == "none" else text
     await update.message.reply_text(
         "What are your health or diet goals? "
-        "(e.g., 'high protein', 'lighter dinners', 'no sugar' — or 'none')"
+        "(e.g., 'high protein', 'lighter dinners', 'no sugar', or 'none')"
     )
     return GOALS
 
@@ -95,8 +95,8 @@ async def disliked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def spice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["profile"]["spice_tolerance"] = update.message.text.strip()
     await update.message.reply_text(
-        "Last one — anything else I should know? "
-        "(e.g., 'I usually skip dinner', 'partner is on a diet', 'we eat early' — or 'none')",
+        "Last one. Anything else I should know? "
+        "(e.g., 'I usually skip dinner', 'partner is on a diet', 'we eat early', or 'none')",
         reply_markup=ReplyKeyboardRemove(),
     )
     return NOTES
@@ -116,10 +116,10 @@ async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"Diet: {profile['diet_type']}\n"
         f"Allergies: {profile['allergies'] or 'none'}\n"
         f"Goals: {profile['health_goals'] or 'none'}\n"
-        f"Loves: {', '.join(profile['loved_cuisines']) or '—'}\n"
-        f"Avoids: {', '.join(profile['disliked_cuisines']) or '—'}\n"
+        f"Loves: {', '.join(profile['loved_cuisines']) or 'none'}\n"
+        f"Avoids: {', '.join(profile['disliked_cuisines']) or 'none'}\n"
         f"Spice: {profile['spice_tolerance']}\n"
-        f"Notes: {profile['other_notes'] or '—'}\n\n"
+        f"Notes: {profile['other_notes'] or 'none'}\n\n"
         "If your partner hasn't onboarded yet, ask them to send /start.\n"
         "Once both of you are in, I can start planning meals."
     )

@@ -38,9 +38,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["Household status:"]
     for p in profiles:
         if p.get("diet_type"):
-            lines.append(f"✅ {p['name']} — {p['diet_type']}")
+            lines.append(f"✅ {p['name']}, {p['diet_type']}")
         else:
-            lines.append(f"⏳ {p['name']} — onboarding incomplete")
+            lines.append(f"⏳ {p['name']}, onboarding incomplete")
     await update.message.reply_text("\n".join(lines))
 
 

@@ -25,14 +25,14 @@ def build_household_context(chat_id: int) -> str:
         if not p.get("diet_type"):
             lines.append(f"- {p['name']}: not yet onboarded")
             continue
-        loves = ", ".join(p["loved_cuisines"]) if p.get("loved_cuisines") else "—"
-        avoids = ", ".join(p["disliked_cuisines"]) if p.get("disliked_cuisines") else "—"
+        loves = ", ".join(p["loved_cuisines"]) if p.get("loved_cuisines") else "none recorded"
+        avoids = ", ".join(p["disliked_cuisines"]) if p.get("disliked_cuisines") else "none recorded"
         lines.append(
-            f"- {p['name']}: {p['diet_type']}; spice {p['spice_tolerance'] or '—'}; "
-            f"loves {loves}; avoids {avoids}; "
-            f"goals: {p.get('health_goals') or '—'}; "
-            f"allergies: {p.get('allergies') or '—'}; "
-            f"notes: {p.get('other_notes') or '—'}"
+            f"- {p['name']}: {p['diet_type']}, spice {p['spice_tolerance'] or 'none recorded'}, "
+            f"loves {loves}, avoids {avoids}, "
+            f"goals: {p.get('health_goals') or 'none recorded'}, "
+            f"allergies: {p.get('allergies') or 'none recorded'}, "
+            f"notes: {p.get('other_notes') or 'none recorded'}"
         )
     return "\n".join(lines)
 
