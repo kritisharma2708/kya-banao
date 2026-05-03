@@ -37,9 +37,39 @@ def build_household_context(chat_id: int) -> str:
     return "\n".join(lines)
 
 
+HISTORY_TURNS = 20
+
+
+def _format_user_message(user_name: str, text: str) -> str:
+    return f"[{user_name}] {text}"
+
+
+def _build_messages(chat_id: int, user_name: str, current_message: str):
+    history = db.get_recent_messages(chat_id, limit=HISTORY_TURNS)
+    messages = []
+    for m in history:
+        if m["role"] == "user":
+            label = m["user_name"] or "user"
+            messages.append({"role": "user", "content": f"[{label}] {m['content']}"})
+        else:
+            messages.append({"role": "assistant", "content": m["content"]})
+    messages.append({"role": "user", "content": _format_user_message(user_name, current_message)})
+
+    # Anthropic API requires alternating user/assistant; collapse consecutive same-role
+    # messages by joining their content (groups in this app come from the same user firing
+    # multiple texts in a row, which is normal in Telegram).
+    collapsed = []
+    for m in messages:
+        if collapsed and collapsed[-1]["role"] == m["role"]:
+            collapsed[-1]["content"] += "\n" + m["content"]
+        else:
+            collapsed.append(m)
+    return collapsed
+
+
 def respond(chat_id: int, user_name: str, message: str) -> str:
     household_context = build_household_context(chat_id)
-    user_message = f"From {user_name}: {message}"
+    messages = _build_messages(chat_id, user_name, message)
 
     response = client.messages.create(
         model=MODEL,
@@ -60,7 +90,13 @@ def respond(chat_id: int, user_name: str, message: str) -> str:
                 "text": household_context,
             },
         ],
-        messages=[{"role": "user", "content": user_message}],
+        messages=messages,
     )
 
-    return response.content[0].text.strip()
+    reply = response.content[0].text.strip()
+
+    # Persist both turns for next call
+    db.save_message(chat_id, "user", message, user_name=user_name)
+    db.save_message(chat_id, "assistant", reply, user_name=None)
+
+    return reply

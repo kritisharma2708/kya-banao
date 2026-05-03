@@ -69,6 +69,17 @@ def init_db():
                 refresh_token TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                user_name TEXT,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
         """)
 
 
@@ -143,3 +154,24 @@ def get_household_profiles(chat_id: int):
             WHERE u.chat_id = ?
         """, (chat_id,)).fetchall()
         return [dict(r) for r in rows]
+
+
+def save_message(chat_id: int, role: str, content: str, user_name: str = None):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO messages (chat_id, role, user_name, content) VALUES (?, ?, ?, ?)",
+            (chat_id, role, user_name, content),
+        )
+
+
+def get_recent_messages(chat_id: int, limit: int = 20):
+    """Return last N messages for chat in chronological order."""
+    with conn() as c:
+        rows = c.execute("""
+            SELECT role, user_name, content
+            FROM messages
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (chat_id, limit)).fetchall()
+        return [dict(r) for r in reversed(rows)]
