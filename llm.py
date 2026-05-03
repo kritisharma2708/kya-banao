@@ -103,6 +103,21 @@ def build_household_context(chat_id: int) -> str:
     parts = [f"Today is {today_str} ({today.isoformat()})."]
 
     if profiles:
+        # Surface dietary constraints as their own block so they cannot be missed
+        constraint_lines = []
+        for p in profiles:
+            diet = (p.get("diet_type") or "").strip()
+            if diet == "Eggetarian":
+                constraint_lines.append(f"- {p['name']} is EGGETARIAN. NO chicken, mutton, beef, pork, fish, prawns, or any meat or seafood. Eggs and dairy are fine.")
+            elif diet == "Vegetarian":
+                constraint_lines.append(f"- {p['name']} is VEGETARIAN. NO meat, fish, seafood, or eggs. Dairy is fine.")
+            elif diet == "Vegan":
+                constraint_lines.append(f"- {p['name']} is VEGAN. NO meat, fish, seafood, eggs, dairy, or any animal product.")
+            elif diet == "Non-vegetarian":
+                constraint_lines.append(f"- {p['name']} is non-vegetarian. No diet restriction beyond stated allergies.")
+        if constraint_lines:
+            parts.append("DIETARY CONSTRAINTS (absolute, non-negotiable, treat like allergies):\n" + "\n".join(constraint_lines))
+
         lines = ["Household members:"]
         for p in profiles:
             if not p.get("diet_type"):
@@ -168,6 +183,11 @@ Hard formatting rules. These will break the output if violated:
 - **NO bullet hyphens** at the start of lines. Use plain prose lines.
 - Stay in Remy's voice (sensory, specific, never generic praise words).
 - One opening line, then the 7 days, then the discovery, then an optional one-line sign-off. That's it.
+
+DIETARY RULES (absolute):
+- Read the DIETARY CONSTRAINTS block in your context. Honour the strictest diet across the household for every shared meal.
+- If anyone is Eggetarian, Vegetarian, or Vegan, NEVER suggest chicken, mutton, fish, prawns, beef, pork, or any meat. Don't even pair them as alternatives ("paneer or chicken"). Eliminate the meat option entirely.
+- The discovery suggestion at the end must also follow these rules. No "try a Vietnamese chicken salad" if the household is eggetarian.
 
 If only one partner is onboarded, just plan in their voice. Weave the partner-onboarding nudge in casually if at all. Do not append a robotic disclaimer at the end.
 
