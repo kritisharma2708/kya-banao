@@ -9,7 +9,7 @@ from telegram.ext import (
 
 import db
 
-NAME, DIET, ALLERGIES, GOALS, LOVED, DISLIKED, SPICE, NOTES = range(8)
+DIET, ALLERGIES, GOALS, LOVED, DISLIKED, SPICE, NOTES = range(7)
 
 DIET_OPTIONS = [["Vegetarian"], ["Non-vegetarian"], ["Eggetarian"], ["Vegan"]]
 SPICE_OPTIONS = [["Mild"], ["Medium"], ["Spicy"], ["Extra spicy"]]
@@ -28,27 +28,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    context.user_data["profile"] = {}
+    context.user_data["profile"] = {"name": user.first_name}
     await update.message.reply_text(
-        f"Hey {user.first_name}! I'm Kya Banao? — your home meal planning agent.\n\n"
-        "I'll ask you a few quick questions to learn your food preferences. "
-        "Both you and your partner should run /start so I know both of you.\n\n"
-        "What should I call you? (or just send your first name)",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return NAME
-
-
-async def name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["profile"]["name"] = update.message.text.strip()
-    db.upsert_user(
-        update.effective_user.id,
-        context.user_data["profile"]["name"],
-        update.effective_chat.id,
-    )
-
-    await update.message.reply_text(
-        "What's your diet?",
+        f"Hey {user.first_name}, I'm Remy — kitchen-spirit of this group.\n\n"
+        "A few quick questions so I can learn your food rhythms. Your partner should run /start too whenever they're around.\n\n"
+        "First — what's your diet?",
         reply_markup=ReplyKeyboardMarkup(DIET_OPTIONS, one_time_keyboard=True, resize_keyboard=True),
     )
     return DIET
@@ -157,7 +141,6 @@ def build_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler("start", start), CommandHandler("reonboard", start)],
         states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name)],
             DIET: [MessageHandler(filters.TEXT & ~filters.COMMAND, diet)],
             ALLERGIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, allergies)],
             GOALS: [MessageHandler(filters.TEXT & ~filters.COMMAND, goals)],
