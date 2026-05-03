@@ -161,6 +161,16 @@ def get_profile(user_id: int):
         return p
 
 
+def get_chat_ids_with_onboarded_users():
+    """Return distinct chat_ids that have at least one onboarded user.
+    Used by the weekly plan cron to know which households to send to."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT DISTINCT chat_id FROM users WHERE onboarded = 1 AND chat_id IS NOT NULL"
+        ).fetchall()
+        return [r["chat_id"] for r in rows]
+
+
 def get_household_profiles(chat_id: int):
     with conn() as c:
         rows = c.execute("""

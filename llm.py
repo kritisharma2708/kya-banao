@@ -150,6 +150,36 @@ def _build_messages(chat_id: int, user_name: str, current_message: str):
     return collapsed
 
 
+WEEKLY_PLAN_PROMPT = """It's time for the weekly plan. Generate a 7-day meal outlook for this household, starting from today.
+
+Stay in your voice (sensory, no em-dashes, no generic praise words). You can be slightly longer than usual since this is the weekly slot, but stay tight. No bullet lists, no nutrition lectures.
+
+Suggested shape (deviate if you want):
+- One opening line that feels like Remy
+- 7 short day lines: each with the day name, whether the cook is around or not (use the cook schedule in your context), and one specific dish or meal direction
+- One discovery suggestion at the end: a single new dish, snack, or cuisine to try this week
+- Optional one-line sign-off
+
+Honour every remembered fact and cook leave in your context. If a partner hasn't onboarded, plan around the one who has and mention it casually.
+
+Output exactly the message you want sent to the group, nothing else."""
+
+
+def generate_weekly_plan(chat_id: int) -> str:
+    household_context = build_household_context(chat_id)
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        system=[
+            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": household_context},
+        ],
+        messages=[{"role": "user", "content": WEEKLY_PLAN_PROMPT}],
+    )
+    return "".join(b.text for b in response.content if b.type == "text").strip()
+
+
 def respond(chat_id: int, user_name: str, message: str) -> str:
     messages = _build_messages(chat_id, user_name, message)
 

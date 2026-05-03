@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import time as dt_time, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -7,6 +8,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 import db
 import onboarding
 import llm
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 load_dotenv()
 
@@ -44,6 +47,36 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual trigger: generate and send a weekly plan to this chat."""
+    chat = update.effective_chat
+    profiles = db.get_household_profiles(chat.id)
+    if not any(p.get("diet_type") for p in profiles):
+        await update.message.reply_text("Need at least one onboarded user before I can plan. Send /start.")
+        return
+    try:
+        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+        plan = llm.generate_weekly_plan(chat.id)
+        await update.message.reply_text(plan)
+        db.save_message(chat.id, "assistant", plan, user_name=None)
+    except Exception as e:
+        logger.exception("Weekly plan error")
+        await update.message.reply_text(f"(Couldn't generate plan: {e})")
+
+
+async def send_weekly_plan(context: ContextTypes.DEFAULT_TYPE):
+    """Cron callback: post the Sunday weekly plan to every household group with onboarded users."""
+    chat_ids = db.get_chat_ids_with_onboarded_users()
+    logger.info(f"Sunday weekly plan firing for {len(chat_ids)} chat(s)")
+    for chat_id in chat_ids:
+        try:
+            plan = llm.generate_weekly_plan(chat_id)
+            await context.bot.send_message(chat_id=chat_id, text=plan)
+            db.save_message(chat_id, "assistant", plan, user_name=None)
+        except Exception as e:
+            logger.exception(f"Failed to send weekly plan to {chat_id}: {e}")
+
+
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -72,7 +105,17 @@ def build_app() -> Application:
     app.add_handler(onboarding.build_handler())
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
+
+    # Sunday 6 PM IST weekly plan
+    app.job_queue.run_daily(
+        callback=send_weekly_plan,
+        time=dt_time(hour=18, minute=0, tzinfo=IST),
+        days=(6,),  # 0=Mon..6=Sun
+        name="weekly_plan",
+    )
+    logger.info("Scheduled weekly_plan cron for Sunday 18:00 IST")
 
     return app
 
