@@ -1,7 +1,7 @@
 import sqlite3
 import json
 import os
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from contextlib import contextmanager
 
 DB_PATH = os.getenv("DATABASE_URL", "kya_banao.db")
@@ -80,7 +80,23 @@ def init_db():
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
+
+            CREATE TABLE IF NOT EXISTS household_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                fact TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_facts_chat ON household_facts(chat_id);
         """)
+
+        # Migrations: cook_events originally had no chat_id/notes columns
+        cols = {row[1] for row in c.execute("PRAGMA table_info(cook_events)").fetchall()}
+        if "chat_id" not in cols:
+            c.execute("ALTER TABLE cook_events ADD COLUMN chat_id INTEGER")
+        if "notes" not in cols:
+            c.execute("ALTER TABLE cook_events ADD COLUMN notes TEXT")
 
 
 def upsert_user(user_id: int, name: str, chat_id: int):
@@ -175,3 +191,52 @@ def get_recent_messages(chat_id: int, limit: int = 20):
             LIMIT ?
         """, (chat_id, limit)).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+
+def add_household_fact(chat_id: int, fact: str):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO household_facts (chat_id, fact) VALUES (?, ?)",
+            (chat_id, fact),
+        )
+
+
+def get_household_facts(chat_id: int):
+    with conn() as c:
+        rows = c.execute(
+            "SELECT fact FROM household_facts WHERE chat_id = ? ORDER BY id",
+            (chat_id,),
+        ).fetchall()
+        return [r["fact"] for r in rows]
+
+
+def log_cook_leave(chat_id: int, start_date: str, end_date: str, reason: str = ""):
+    """Set cook on leave for each day in the inclusive range. Replaces any existing
+    entry for that date so Remy can correct himself if needed."""
+    start = datetime.fromisoformat(start_date).date()
+    end = datetime.fromisoformat(end_date).date()
+    with conn() as c:
+        d = start
+        while d <= end:
+            c.execute(
+                "DELETE FROM cook_events WHERE chat_id = ? AND event_date = ?",
+                (chat_id, d.isoformat()),
+            )
+            c.execute(
+                "INSERT INTO cook_events (chat_id, event_date, status, notes) VALUES (?, ?, ?, ?)",
+                (chat_id, d.isoformat(), "on_leave", reason or None),
+            )
+            d += timedelta(days=1)
+
+
+def get_upcoming_cook_events(chat_id: int, days_ahead: int = 21):
+    today = date.today().isoformat()
+    cutoff = (date.today() + timedelta(days=days_ahead)).isoformat()
+    with conn() as c:
+        rows = c.execute("""
+            SELECT event_date, status, notes
+            FROM cook_events
+            WHERE chat_id = ? AND event_date >= ? AND event_date <= ?
+            ORDER BY event_date
+        """, (chat_id, today, cutoff)).fetchall()
+        return [dict(r) for r in rows]
