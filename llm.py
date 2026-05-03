@@ -1,5 +1,6 @@
 import os
-from datetime import date
+import re
+from datetime import date, timedelta
 from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -97,7 +98,9 @@ def build_household_context(chat_id: int) -> str:
     facts = db.get_household_facts(chat_id)
     upcoming = db.get_upcoming_cook_events(chat_id)
 
-    parts = [f"Today is {date.today().isoformat()}."]
+    today = date.today()
+    today_str = today.strftime("%A, %B %-d, %Y")
+    parts = [f"Today is {today_str} ({today.isoformat()})."]
 
     if profiles:
         lines = ["Household members:"]
@@ -150,34 +153,71 @@ def _build_messages(chat_id: int, user_name: str, current_message: str):
     return collapsed
 
 
-WEEKLY_PLAN_PROMPT = """It's time for the weekly plan. Generate a 7-day meal outlook for this household, starting from today.
+WEEKLY_PLAN_INSTRUCTION = """Time for the weekly plan. The 7 days you are planning for are listed below. Use those dates and day names exactly as written. Do not invent or shift dates.
 
-Stay in your voice (sensory, no em-dashes, no generic praise words). You can be slightly longer than usual since this is the weekly slot, but stay tight. No bullet lists, no nutrition lectures.
+For each of the 7 days, suggest:
+- **Breakfast**, **Lunch**, **Dinner** (3 meals per day, every day)
+- For each meal, give one specific dish or meal direction in one short phrase, not a paragraph
+- For days where the cook is on leave (check your cook schedule in context), lean toward order or eat-out suggestions; for days the cook is around, suggest things she or he can make at home
 
-Suggested shape (deviate if you want):
-- One opening line that feels like Remy
-- 7 short day lines: each with the day name, whether the cook is around or not (use the cook schedule in your context), and one specific dish or meal direction
-- One discovery suggestion at the end: a single new dish, snack, or cuisine to try this week
-- Optional one-line sign-off
+End with one discovery suggestion: a single new dish, snack, or cuisine the household should try this week.
 
-Honour every remembered fact and cook leave in your context. If a partner hasn't onboarded, plan around the one who has and mention it casually.
+Hard formatting rules. These will break the output if violated:
+- **NO em-dashes (—) anywhere.** Use commas, periods, or new sentences.
+- **NO markdown asterisks** for bold. Don't write **like this**. Just write plain text.
+- **NO bullet hyphens** at the start of lines. Use plain prose lines.
+- Stay in Remy's voice (sensory, specific, never generic praise words).
+- One opening line, then the 7 days, then the discovery, then an optional one-line sign-off. That's it.
 
-Output exactly the message you want sent to the group, nothing else."""
+If only one partner is onboarded, just plan in their voice. Weave the partner-onboarding nudge in casually if at all. Do not append a robotic disclaimer at the end.
+
+Output the exact message to send. Nothing else.
+"""
+
+
+def _format_week_block() -> tuple[str, date]:
+    """Return (formatted block, start_date) for the upcoming Mon→Sun week.
+    Plan starts tomorrow regardless of when this is called, which gives
+    Sunday-evening cron the natural Mon→Sun shape."""
+    plan_start = date.today() + timedelta(days=1)
+    lines = []
+    for i in range(7):
+        d = plan_start + timedelta(days=i)
+        lines.append(f"  {d.strftime('%A, %B %-d, %Y')} (date {d.isoformat()})")
+    return "Plan for these 7 days:\n" + "\n".join(lines), plan_start
+
+
+def _strip_formatting(text: str) -> str:
+    """Belt-and-suspenders: remove em-dashes and markdown asterisks even if the
+    model slips. Em-dashes become commas (with surrounding-space cleanup),
+    asterisks are removed entirely."""
+    # Replace " — " patterns and bare em-dashes with comma-space
+    text = re.sub(r"\s*—\s*", ", ", text)
+    # Remove bold asterisks (**text** or *text*)
+    text = re.sub(r"\*+", "", text)
+    # Collapse any double commas the substitution might have created
+    text = re.sub(r",\s*,", ",", text)
+    # Tidy up multiple blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def generate_weekly_plan(chat_id: int) -> str:
     household_context = build_household_context(chat_id)
+    week_block, _ = _format_week_block()
+    instruction = WEEKLY_PLAN_INSTRUCTION + "\n\n" + week_block
     response = client.messages.create(
         model=MODEL,
-        max_tokens=1024,
+        max_tokens=2048,
         system=[
             {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": household_context},
         ],
-        messages=[{"role": "user", "content": WEEKLY_PLAN_PROMPT}],
+        messages=[{"role": "user", "content": instruction}],
     )
-    return "".join(b.text for b in response.content if b.type == "text").strip()
+    raw = "".join(b.text for b in response.content if b.type == "text").strip()
+    return _strip_formatting(raw)
 
 
 def respond(chat_id: int, user_name: str, message: str) -> str:
