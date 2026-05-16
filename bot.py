@@ -58,7 +58,7 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.send_chat_action(chat_id=chat.id, action="typing")
-        plan = llm.generate_weekly_plan(chat.id)
+        plan = await llm.generate_weekly_plan(chat.id)
         await update.message.reply_text(plan)
         db.save_message(chat.id, "assistant", plan, user_name=None)
     except Exception as e:
@@ -119,7 +119,7 @@ async def send_weekly_plan(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Sunday weekly plan firing for {len(chat_ids)} chat(s)")
     for chat_id in chat_ids:
         try:
-            plan = llm.generate_weekly_plan(chat_id)
+            plan = await llm.generate_weekly_plan(chat_id)
             await context.bot.send_message(chat_id=chat_id, text=plan)
             db.save_message(chat_id, "assistant", plan, user_name=None)
         except Exception as e:
@@ -137,7 +137,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await context.bot.send_chat_action(chat_id=chat.id, action="typing")
-        reply = llm.respond(chat.id, name, update.message.text)
+        reply = await llm.respond(chat.id, name, update.message.text)
         await update.message.reply_text(reply)
     except Exception as e:
         logger.exception("LLM error")

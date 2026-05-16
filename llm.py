@@ -1,16 +1,19 @@
+import json
 import os
 import re
 from datetime import date, timedelta
 from pathlib import Path
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
 import db
+import swiggy_mcp
 
 load_dotenv()
 
-client = Anthropic()
+client = AsyncAnthropic()
 MODEL = "claude-sonnet-4-6"
+SWIGGY_DEFAULT_ADDRESS_ID = os.getenv("SWIGGY_DEFAULT_ADDRESS_ID")
 
 PROJECT_DIR = Path(__file__).parent
 SOUL = (PROJECT_DIR / "soul.md").read_text()
@@ -69,10 +72,67 @@ TOOLS = [
             "required": ["fact"],
         },
     },
+    {
+        "name": "instamart_go_to_items",
+        "description": (
+            "Fetch the household's frequent/recent Instamart purchases (curd, paneer, snacks, staples). "
+            "Use BEFORE suggesting meals or asking 'what's at home?', to ground suggestions in what they actually buy. "
+            "Read-only, safe to call freely."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "instamart_recent_orders",
+        "description": (
+            "Fetch the household's recent Instamart order history. Use when you need to know what was bought when, "
+            "infer cadence (\"milk every 4 days?\"), or check \"have we ordered X this week?\". Read-only."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "instamart_search",
+        "description": (
+            "Search Instamart for a specific product. Use to confirm availability or get current price for an item "
+            "mentioned in conversation (\"is fresh basil available?\", \"what's amul ghee at?\"). Read-only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Product name to search, e.g. 'amul milk', 'fresh ginger'."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "instamart_cart",
+        "description": "Get current Instamart cart contents. Use to check what's queued before suggesting additions. Read-only.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 
-def execute_tool(chat_id: int, name: str, args: dict) -> str:
+def _summarize_go_to(payload: dict) -> str:
+    products = (payload.get("data") or {}).get("products") or []
+    items = []
+    for p in products[:15]:
+        variants = p.get("variations") or []
+        in_stock = [v for v in variants if v.get("isInStockAndAvailable")]
+        chosen = min(in_stock, key=lambda v: v["price"]["offerPrice"]) if in_stock else (variants[0] if variants else None)
+        items.append({
+            "name": p.get("displayName"),
+            "qty": chosen.get("quantityDescription") if chosen else None,
+            "price_inr": chosen.get("price", {}).get("offerPrice") if chosen else None,
+            "in_stock": p.get("inStock", True),
+        })
+    return json.dumps({"go_to_items": items}, ensure_ascii=False)
+
+
+def _compact(payload: dict, max_chars: int = 2500) -> str:
+    s = json.dumps(payload, ensure_ascii=False)
+    return s if len(s) <= max_chars else s[:max_chars] + "...[truncated]"
+
+
+async def execute_tool(chat_id: int, name: str, args: dict) -> str:
     if name == "log_cook_leave":
         try:
             db.log_cook_leave(
@@ -90,6 +150,35 @@ def execute_tool(chat_id: int, name: str, args: dict) -> str:
             return f"Saved fact: {args['fact']}"
         except Exception as e:
             return f"Failed to save fact: {e}"
+    if name == "instamart_go_to_items":
+        try:
+            payload = await swiggy_mcp.call_tool(
+                "your_go_to_items", {"addressId": SWIGGY_DEFAULT_ADDRESS_ID}
+            )
+            return _summarize_go_to(payload)
+        except Exception as e:
+            return f"Couldn't reach Instamart go-to items: {e}"
+    if name == "instamart_recent_orders":
+        try:
+            payload = await swiggy_mcp.call_tool("get_orders", {})
+            return _compact(payload)
+        except Exception as e:
+            return f"Couldn't reach Instamart order history: {e}"
+    if name == "instamart_search":
+        try:
+            payload = await swiggy_mcp.call_tool(
+                "search_products",
+                {"addressId": SWIGGY_DEFAULT_ADDRESS_ID, "query": args["query"]},
+            )
+            return _compact(payload)
+        except Exception as e:
+            return f"Couldn't search Instamart: {e}"
+    if name == "instamart_cart":
+        try:
+            payload = await swiggy_mcp.call_tool("get_cart", {})
+            return _compact(payload)
+        except Exception as e:
+            return f"Couldn't reach Instamart cart: {e}"
     return f"Unknown tool: {name}"
 
 
@@ -222,11 +311,11 @@ def _strip_formatting(text: str) -> str:
     return text.strip()
 
 
-def generate_weekly_plan(chat_id: int) -> str:
+async def generate_weekly_plan(chat_id: int) -> str:
     household_context = build_household_context(chat_id)
     week_block, _ = _format_week_block()
     instruction = WEEKLY_PLAN_INSTRUCTION + "\n\n" + week_block
-    response = client.messages.create(
+    response = await client.messages.create(
         model=MODEL,
         max_tokens=2048,
         system=[
@@ -240,13 +329,13 @@ def generate_weekly_plan(chat_id: int) -> str:
     return _strip_formatting(raw)
 
 
-def respond(chat_id: int, user_name: str, message: str) -> str:
+async def respond(chat_id: int, user_name: str, message: str) -> str:
     messages = _build_messages(chat_id, user_name, message)
 
     response = None
     for _ in range(5):  # tool-use loop, max 5 iterations
         household_context = build_household_context(chat_id)
-        response = client.messages.create(
+        response = await client.messages.create(
             model=MODEL,
             max_tokens=512,
             system=[
@@ -267,7 +356,7 @@ def respond(chat_id: int, user_name: str, message: str) -> str:
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
-                result = execute_tool(chat_id, block.name, block.input)
+                result = await execute_tool(chat_id, block.name, block.input)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
