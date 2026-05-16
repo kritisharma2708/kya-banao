@@ -8,6 +8,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 import db
 import onboarding
 import llm
+import swiggy_mcp
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -20,6 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SWIGGY_DEFAULT_ADDRESS_ID = os.getenv("SWIGGY_DEFAULT_ADDRESS_ID")
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -64,6 +66,53 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"(Couldn't generate plan: {e})")
 
 
+def _render_staples(payload: dict) -> str:
+    products = (payload.get("data") or {}).get("products") or []
+    if not products:
+        return "No go-to items came back from Instamart yet."
+
+    lines = ["Your Instamart go-to items:"]
+    for p in products[:20]:
+        name = p.get("displayName", "unknown")
+        # Pick the cheapest in-stock variation for a representative size + price
+        variants = p.get("variations") or []
+        in_stock = [v for v in variants if v.get("isInStockAndAvailable")]
+        chosen = min(in_stock, key=lambda v: v["price"]["offerPrice"]) if in_stock else (variants[0] if variants else None)
+        qty = chosen.get("quantityDescription") if chosen else None
+        price = chosen.get("price", {}).get("offerPrice") if chosen else None
+        bits = [name]
+        if qty:
+            bits.append(f"({qty})")
+        if price is not None:
+            bits.append(f"₹{price}")
+        if not p.get("inStock", True):
+            bits.append("[out of stock]")
+        lines.append("- " + " ".join(bits))
+    if len(products) > 20:
+        lines.append(f"...and {len(products) - 20} more")
+    return "\n".join(lines)
+
+
+async def staples(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show Instamart go-to items for the default address."""
+    if not SWIGGY_DEFAULT_ADDRESS_ID:
+        await update.message.reply_text("SWIGGY_DEFAULT_ADDRESS_ID isn't set. Add it to .env.")
+        return
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        payload = await swiggy_mcp.call_tool(
+            "your_go_to_items",
+            {"addressId": SWIGGY_DEFAULT_ADDRESS_ID},
+        )
+        logger.info(f"your_go_to_items raw payload: {payload}")
+        await update.message.reply_text(_render_staples(payload))
+    except swiggy_mcp.SwiggyAuthRequired as e:
+        await update.message.reply_text(f"Swiggy auth needed: {e}")
+    except Exception as e:
+        logger.exception("staples error")
+        await update.message.reply_text(f"(Couldn't fetch staples: {e})")
+
+
 async def send_weekly_plan(context: ContextTypes.DEFAULT_TYPE):
     """Cron callback: post the Sunday weekly plan to every household group with onboarded users."""
     chat_ids = db.get_chat_ids_with_onboarded_users()
@@ -106,6 +155,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("plan", plan_command))
+    app.add_handler(CommandHandler("staples", staples))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
 
     # Sunday 6 PM IST weekly plan
