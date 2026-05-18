@@ -137,10 +137,11 @@ TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "spinId": {"type": "string", "description": "Product variation ID from search/go-to results."},
+                            "spinId": {"type": "string", "description": "Product variation ID from search results."},
                             "quantity": {"type": "number", "description": "How many of this variation to add."},
+                            "name": {"type": "string", "description": "Human-readable item name (e.g. 'NOICE Bhakarwadi 100g'). Used for honest reporting if Swiggy silently drops this item due to out-of-stock."},
                         },
-                        "required": ["spinId", "quantity"],
+                        "required": ["spinId", "quantity", "name"],
                     },
                 },
             },
@@ -286,13 +287,18 @@ async def _stage_cart(new_items: list[dict]) -> str:
         {"selectedAddressId": SWIGGY_DEFAULT_ADDRESS_ID, "items": merged_list},
     )
 
-    # Verify: Swiggy occasionally drops items silently despite returning success
+    # Verify: Swiggy drops out-of-stock items silently despite update_cart returning success
     verify_payload = await swiggy_mcp.call_tool("get_cart", {})
     actual = _existing_cart_items(verify_payload)
     actual_spins = {it["spinId"] for it in actual}
+    name_by_spin = {it["spinId"]: it.get("name") or it["spinId"] for it in new_items}
+
     requested_spins = {it["spinId"] for it in new_items}
-    dropped = sorted(requested_spins - actual_spins)
-    landed = sorted(requested_spins & actual_spins)
+    landed_spins = requested_spins & actual_spins
+    dropped_spins = requested_spins - actual_spins
+
+    landed = [{"spinId": s, "name": name_by_spin[s]} for s in sorted(landed_spins)]
+    dropped = [{"spinId": s, "name": name_by_spin[s]} for s in sorted(dropped_spins)]
 
     return json.dumps({
         "requested": new_items,
@@ -301,10 +307,10 @@ async def _stage_cart(new_items: list[dict]) -> str:
         "final_cart": [{"spinId": i["spinId"], "name": i.get("itemName"), "qty": i.get("quantity"), "price": i.get("discountedFinalPrice")}
                        for i in (verify_payload.get("data") or {}).get("items") or []],
         "warning": (
-            "Swiggy claimed success but actually dropped these items. Tell Kriti truthfully — do NOT say they were added. "
-            "She may need to add them manually in the app, or try a different variation/brand."
+            "Swiggy silently rejected the dropped items, almost certainly because they're out of stock at the current "
+            "fulfillment store. Tell Kriti specifically which items dropped (by name), do NOT claim they were added, "
+            "and suggest she try a different brand/variation or add them manually in the app."
         ) if dropped else None,
-        "app_sync_warning": "After staging, Kriti should open Swiggy fresh and checkout WITHOUT touching the cart. Any add/remove in the app overwrites the server cart and may wipe these additions.",
     }, ensure_ascii=False)[:3000]
 
 
