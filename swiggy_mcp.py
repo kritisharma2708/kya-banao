@@ -59,9 +59,9 @@ def _build_auth() -> OAuthClientProvider:
 
 def _unwrap(result: Any) -> dict[str, Any]:
     """Instamart tools wrap their JSON payload as a string in content[0].text.
-    Returns the inner Swiggy envelope ({success, data, ...}) or raises."""
-    if getattr(result, "isError", False):
-        raise RuntimeError(f"Tool returned error: {result}")
+    Returns the inner Swiggy envelope ({success, data} on success, or
+    {success: False, error} on application errors like 'cart not found').
+    Raises only when the MCP envelope itself is malformed (transport failure)."""
     blocks = getattr(result, "content", None) or []
     if not blocks or getattr(blocks[0], "type", None) != "text":
         raise RuntimeError(f"Unexpected MCP result shape: {result}")

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from datetime import date, timedelta
@@ -10,6 +11,8 @@ import db
 import swiggy_mcp
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 client = AsyncAnthropic()
 MODEL = "claude-sonnet-4-6"
@@ -108,6 +111,50 @@ TOOLS = [
         "description": "Get current Instamart cart contents. Use to check what's queued before suggesting additions. Read-only.",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "instamart_stage_cart",
+        "description": (
+            "Add items to Kriti's Instamart cart for HER to checkout in the Swiggy app. "
+            "This is the only write tool you have. You do NOT place orders — you stage; Kriti reviews and pays. "
+            "Always close your reply with 'open Swiggy to checkout' so she knows the next step is on her. "
+            "\n\n"
+            "How to use: first call instamart_search or instamart_go_to_items to find spinIds for the products. "
+            "Each variation of a product has its own spinId (e.g., 200g vs 400g of the same item are different spinIds). "
+            "Then call this with the spinIds and quantities. "
+            "\n\n"
+            "Items merge with whatever's already in the cart (additive). If the user says 'scratch that, start over', "
+            "call instamart_clear_cart first. "
+            "\n\n"
+            "NEVER stage anything that violates household dietary constraints. NEVER stage without the user asking for it "
+            "(no surprise carts). When in doubt, suggest in voice first and wait for a 'yes, add it'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "Items to add to cart.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "spinId": {"type": "string", "description": "Product variation ID from search/go-to results."},
+                            "quantity": {"type": "number", "description": "How many of this variation to add."},
+                        },
+                        "required": ["spinId", "quantity"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    },
+    {
+        "name": "instamart_clear_cart",
+        "description": (
+            "Empty the entire Instamart cart. Use only when the user explicitly says scrap it, start over, "
+            "or 'clear the cart'. Never call this preemptively. Safe to call when cart is already empty."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -133,6 +180,13 @@ def _compact(payload: dict, max_chars: int = 2500) -> str:
 
 
 async def execute_tool(chat_id: int, name: str, args: dict) -> str:
+    logger.info(f"tool call: {name} args={json.dumps(args, ensure_ascii=False)[:300]}")
+    result = await _execute_tool_inner(chat_id, name, args)
+    logger.info(f"tool result: {name} -> {result[:300]}")
+    return result
+
+
+async def _execute_tool_inner(chat_id: int, name: str, args: dict) -> str:
     if name == "log_cook_leave":
         try:
             db.log_cook_leave(
@@ -179,7 +233,79 @@ async def execute_tool(chat_id: int, name: str, args: dict) -> str:
             return _compact(payload)
         except Exception as e:
             return f"Couldn't reach Instamart cart: {e}"
+    if name == "instamart_stage_cart":
+        try:
+            return await _stage_cart(args.get("items") or [])
+        except Exception as e:
+            return f"Couldn't stage cart: {e}"
+    if name == "instamart_clear_cart":
+        try:
+            payload = await swiggy_mcp.call_tool("clear_cart", {})
+            return _compact(payload)
+        except Exception as e:
+            return f"Couldn't clear cart: {e}"
     return f"Unknown tool: {name}"
+
+
+def _existing_cart_items(get_cart_payload: dict) -> list[dict]:
+    """Extract [{spinId, quantity}, ...] from a get_cart payload, or [] if cart is empty.
+    Swiggy returns success=false with 'cart not found' when cart is empty — treat that as []."""
+    if not get_cart_payload.get("success"):
+        return []
+    data = get_cart_payload.get("data") or {}
+    # Cart item shape varies; defensively probe common keys
+    items = data.get("items") or data.get("cartItems") or data.get("products") or []
+    extracted = []
+    for it in items:
+        spin = it.get("spinId") or it.get("spin_id")
+        qty = it.get("quantity") or it.get("qty") or 0
+        if spin and qty:
+            extracted.append({"spinId": spin, "quantity": qty})
+    return extracted
+
+
+async def _stage_cart(new_items: list[dict]) -> str:
+    """Merge new_items with the existing cart, call update_cart, then verify by
+    re-querying. Swiggy can return success=true while silently dropping items,
+    so the verify step is what tells Remy the actual truth to report."""
+    if not new_items:
+        return json.dumps({"error": "no items provided"})
+
+    get_payload = await swiggy_mcp.call_tool("get_cart", {})
+    existing = _existing_cart_items(get_payload)
+
+    merged: dict[str, float] = {}
+    for it in existing:
+        merged[it["spinId"]] = merged.get(it["spinId"], 0) + it["quantity"]
+    for it in new_items:
+        merged[it["spinId"]] = merged.get(it["spinId"], 0) + it["quantity"]
+    merged_list = [{"spinId": s, "quantity": q} for s, q in merged.items()]
+
+    await swiggy_mcp.call_tool(
+        "update_cart",
+        {"selectedAddressId": SWIGGY_DEFAULT_ADDRESS_ID, "items": merged_list},
+    )
+
+    # Verify: Swiggy occasionally drops items silently despite returning success
+    verify_payload = await swiggy_mcp.call_tool("get_cart", {})
+    actual = _existing_cart_items(verify_payload)
+    actual_spins = {it["spinId"] for it in actual}
+    requested_spins = {it["spinId"] for it in new_items}
+    dropped = sorted(requested_spins - actual_spins)
+    landed = sorted(requested_spins & actual_spins)
+
+    return json.dumps({
+        "requested": new_items,
+        "landed_in_cart": landed,
+        "dropped_by_swiggy": dropped,
+        "final_cart": [{"spinId": i["spinId"], "name": i.get("itemName"), "qty": i.get("quantity"), "price": i.get("discountedFinalPrice")}
+                       for i in (verify_payload.get("data") or {}).get("items") or []],
+        "warning": (
+            "Swiggy claimed success but actually dropped these items. Tell Kriti truthfully — do NOT say they were added. "
+            "She may need to add them manually in the app, or try a different variation/brand."
+        ) if dropped else None,
+        "app_sync_warning": "After staging, Kriti should open Swiggy fresh and checkout WITHOUT touching the cart. Any add/remove in the app overwrites the server cart and may wipe these additions.",
+    }, ensure_ascii=False)[:3000]
 
 
 def build_household_context(chat_id: int) -> str:
@@ -337,7 +463,7 @@ async def respond(chat_id: int, user_name: str, message: str) -> str:
         household_context = build_household_context(chat_id)
         response = await client.messages.create(
             model=MODEL,
-            max_tokens=512,
+            max_tokens=2048,
             system=[
                 {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
@@ -346,6 +472,7 @@ async def respond(chat_id: int, user_name: str, message: str) -> str:
             tools=TOOLS,
             messages=messages,
         )
+        logger.info(f"stop_reason={response.stop_reason} content_blocks={[b.type for b in response.content]}")
 
         if response.stop_reason != "tool_use":
             break
