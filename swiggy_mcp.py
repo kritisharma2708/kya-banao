@@ -58,14 +58,34 @@ def _build_auth() -> OAuthClientProvider:
 
 
 def _unwrap(result: Any) -> dict[str, Any]:
-    """Instamart tools wrap their JSON payload as a string in content[0].text.
-    Returns the inner Swiggy envelope ({success, data} on success, or
-    {success: False, error} on application errors like 'cart not found').
-    Raises only when the MCP envelope itself is malformed (transport failure)."""
+    """Normalize MCP responses into {success: bool, data?: dict, error?: dict}.
+
+    Swiggy changed their response format around 2026-05-26: structured payloads
+    now live in `result.structuredContent` (proper MCP structured output) and
+    `content[0].text` is a human-readable summary. Old code parsed text as JSON
+    which now blows up. Order of preference:
+      1) isError=True -> synthesize error envelope from the text summary.
+      2) structuredContent present -> wrap as {success, data} for caller compat.
+      3) Legacy JSON-in-text -> parse and return as-is.
+      4) Anything else -> raise."""
     blocks = getattr(result, "content", None) or []
-    if not blocks or getattr(blocks[0], "type", None) != "text":
-        raise RuntimeError(f"Unexpected MCP result shape: {result}")
-    return json.loads(blocks[0].text)
+    text = blocks[0].text if blocks and getattr(blocks[0], "type", None) == "text" else ""
+
+    if getattr(result, "isError", False):
+        message = text.split("\n", 1)[0] if text else "Unknown error"
+        return {"success": False, "error": {"message": message, "raw": text[:400]}}
+
+    sc = getattr(result, "structuredContent", None)
+    if sc is not None:
+        return {"success": True, "data": sc}
+
+    if text:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"success": True, "data": {"text": text}}
+
+    raise RuntimeError(f"Unexpected MCP result shape: {result}")
 
 
 async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:

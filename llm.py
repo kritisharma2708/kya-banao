@@ -266,14 +266,16 @@ def _existing_cart_items(get_cart_payload: dict) -> list[dict]:
 
 
 async def _stage_cart(new_items: list[dict]) -> str:
-    """Merge new_items with the existing cart, call update_cart, then verify by
-    re-querying. Swiggy can return success=true while silently dropping items,
-    so the verify step is what tells Remy the actual truth to report."""
+    """Merge new_items with existing cart, call update_cart, verify via the
+    update_cart response itself (its data.items is the resulting cart state).
+    Resilient when get_cart fails on Swiggy's side — proceeds without merge
+    and warns Remy that existing items may have been wiped."""
     if not new_items:
         return json.dumps({"error": "no items provided"})
 
     get_payload = await swiggy_mcp.call_tool("get_cart", {})
-    existing = _existing_cart_items(get_payload)
+    get_cart_ok = bool(get_payload.get("success"))
+    existing = _existing_cart_items(get_payload) if get_cart_ok else []
 
     merged: dict[str, float] = {}
     for it in existing:
@@ -282,14 +284,21 @@ async def _stage_cart(new_items: list[dict]) -> str:
         merged[it["spinId"]] = merged.get(it["spinId"], 0) + it["quantity"]
     merged_list = [{"spinId": s, "quantity": q} for s, q in merged.items()]
 
-    await swiggy_mcp.call_tool(
+    # Workaround for Swiggy bug: update_cart on a non-empty cart succeeds at the
+    # MCP layer but the mobile app doesn't show new items. Clearing first makes
+    # the app sync properly. Tested 2026-05-21.
+    if existing:
+        await swiggy_mcp.call_tool("clear_cart", {})
+
+    update_payload = await swiggy_mcp.call_tool(
         "update_cart",
         {"selectedAddressId": SWIGGY_DEFAULT_ADDRESS_ID, "items": merged_list},
     )
 
-    # Verify: Swiggy drops out-of-stock items silently despite update_cart returning success
-    verify_payload = await swiggy_mcp.call_tool("get_cart", {})
-    actual = _existing_cart_items(verify_payload)
+    # Verify directly from update_cart's response (its data.items IS the new
+    # cart state). This avoids a second get_cart call, which is helpful when
+    # Swiggy's get_cart is failing but update_cart still works.
+    actual = _existing_cart_items(update_payload) if update_payload.get("success") else []
     actual_spins = {it["spinId"] for it in actual}
     name_by_spin = {it["spinId"]: it.get("name") or it["spinId"] for it in new_items}
 
@@ -300,17 +309,27 @@ async def _stage_cart(new_items: list[dict]) -> str:
     landed = [{"spinId": s, "name": name_by_spin[s]} for s in sorted(landed_spins)]
     dropped = [{"spinId": s, "name": name_by_spin[s]} for s in sorted(dropped_spins)]
 
+    warnings = []
+    if dropped:
+        warnings.append(
+            "Swiggy silently rejected the dropped items, almost certainly out of stock at "
+            "the fulfillment store. Tell Kriti specifically which items dropped (by name); "
+            "suggest a different brand/variation or that she add them manually in the app."
+        )
+    if not get_cart_ok:
+        warnings.append(
+            "Swiggy's get_cart endpoint is failing right now, so I couldn't see what was "
+            "already in the cart before adding. Anything Kriti had manually added before "
+            "this is likely gone — tell her to check the app and re-add anything missing."
+        )
+
     return json.dumps({
         "requested": new_items,
         "landed_in_cart": landed,
         "dropped_by_swiggy": dropped,
         "final_cart": [{"spinId": i["spinId"], "name": i.get("itemName"), "qty": i.get("quantity"), "price": i.get("discountedFinalPrice")}
-                       for i in (verify_payload.get("data") or {}).get("items") or []],
-        "warning": (
-            "Swiggy silently rejected the dropped items, almost certainly because they're out of stock at the current "
-            "fulfillment store. Tell Kriti specifically which items dropped (by name), do NOT claim they were added, "
-            "and suggest she try a different brand/variation or add them manually in the app."
-        ) if dropped else None,
+                       for i in (update_payload.get("data") or {}).get("items") or []],
+        "warning": " ".join(warnings) if warnings else None,
     }, ensure_ascii=False)[:3000]
 
 
