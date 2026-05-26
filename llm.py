@@ -295,10 +295,28 @@ async def _stage_cart(new_items: list[dict]) -> str:
         {"selectedAddressId": SWIGGY_DEFAULT_ADDRESS_ID, "items": merged_list},
     )
 
-    # Verify directly from update_cart's response (its data.items IS the new
-    # cart state). This avoids a second get_cart call, which is helpful when
-    # Swiggy's get_cart is failing but update_cart still works.
-    actual = _existing_cart_items(update_payload) if update_payload.get("success") else []
+    # Verify via a follow-up get_cart — update_cart's response is sometimes a
+    # lie (claims items landed when they actually didn't). get_cart is the
+    # ground truth when it works. Fall back to update_cart's own response if
+    # get_cart is failing.
+    verify_payload = await swiggy_mcp.call_tool("get_cart", {})
+    if verify_payload.get("success"):
+        actual = _existing_cart_items(verify_payload)
+        verify_source = "get_cart"
+    elif update_payload.get("success"):
+        actual = _existing_cart_items(update_payload)
+        verify_source = "update_cart_response_fallback"
+    else:
+        actual = []
+        verify_source = "both_failed"
+
+    logger.info(
+        f"stage_cart: requested={new_items} existing={existing} "
+        f"update_success={update_payload.get('success')} verify_source={verify_source} "
+        f"actual={actual}"
+    )
+
+    actual = actual  # type clarity
     actual_spins = {it["spinId"] for it in actual}
     name_by_spin = {it["spinId"]: it.get("name") or it["spinId"] for it in new_items}
 
@@ -310,17 +328,32 @@ async def _stage_cart(new_items: list[dict]) -> str:
     dropped = [{"spinId": s, "name": name_by_spin[s]} for s in sorted(dropped_spins)]
 
     warnings = []
-    if dropped:
+    if verify_source == "both_failed":
+        # Don't claim drops since we have no source of truth
+        landed = []
+        dropped = []
         warnings.append(
-            "Swiggy silently rejected the dropped items, almost certainly out of stock at "
-            "the fulfillment store. Tell Kriti specifically which items dropped (by name); "
-            "suggest a different brand/variation or that she add them manually in the app."
+            "Both update_cart and get_cart are failing right now (Swiggy backend issue). "
+            "I have no confidence anything landed. Tell Kriti to check the app directly."
         )
+    else:
+        if dropped:
+            warnings.append(
+                "Swiggy silently rejected the dropped items, almost certainly out of stock at "
+                "the fulfillment store. Tell Kriti specifically which items dropped (by name); "
+                "suggest a different brand/variation or that she add them manually in the app."
+            )
+        if verify_source == "update_cart_response_fallback":
+            warnings.append(
+                "Couldn't double-check the cart with a fresh get_cart, so this verify trusts "
+                "update_cart's own claim — which has been known to lie. Tell Kriti to open "
+                "Swiggy and confirm the items are actually there before checkout."
+            )
     if not get_cart_ok:
         warnings.append(
-            "Swiggy's get_cart endpoint is failing right now, so I couldn't see what was "
-            "already in the cart before adding. Anything Kriti had manually added before "
-            "this is likely gone — tell her to check the app and re-add anything missing."
+            "Swiggy's get_cart failed before staging, so I couldn't see what was already in "
+            "the cart. Anything Kriti had manually added before this is likely gone — tell "
+            "her to check the app and re-add anything missing."
         )
 
     return json.dumps({
