@@ -2,8 +2,9 @@ import json
 import logging
 import os
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from statistics import mean
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
@@ -555,3 +556,110 @@ async def respond(chat_id: int, user_name: str, message: str) -> str:
     db.save_message(chat_id, "assistant", reply_text, user_name=None)
 
     return reply_text or "(silence)"
+
+
+# -----------------------------------------------------------------------------
+# Cadence inference: detect items running low based on Instamart order history.
+# -----------------------------------------------------------------------------
+
+# Items ordered less frequently than this are skipped — order history is too
+# short to estimate cadence reliably for monthly-or-rarer purchases.
+MAX_CADENCE_DAYS = 21
+# We only flag an item as running low when (days_since_last - cadence) exceeds
+# this buffer, to avoid pinging on the exact day something is "due."
+CADENCE_BUFFER_DAYS = 1
+
+
+def _compute_cadence_alerts(orders: list[dict], today: date | None = None) -> list[dict]:
+    """Given a list of order objects from get_orders, return items likely
+    running low. Each item needs >= 2 orders to estimate cadence."""
+    today = today or date.today()
+    dates_by_item: dict[str, list[date]] = {}
+    name_by_item: dict[str, str] = {}
+
+    for order in orders:
+        ts = order.get("createdAt") or order.get("orderTime")
+        if not ts:
+            continue
+        try:
+            d = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+        except (ValueError, AttributeError):
+            continue
+        for it in order.get("items") or []:
+            item_id = it.get("itemId") or it.get("spinId")
+            if not item_id:
+                continue
+            dates_by_item.setdefault(item_id, []).append(d)
+            name_by_item[item_id] = it.get("name") or item_id
+
+    alerts = []
+    for item_id, dates in dates_by_item.items():
+        if len(dates) < 2:
+            continue
+        dates = sorted(set(dates))
+        if len(dates) < 2:
+            continue
+        intervals = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+        intervals = [iv for iv in intervals if iv > 0]
+        if not intervals:
+            continue
+        cadence = mean(intervals)
+        if cadence > MAX_CADENCE_DAYS:
+            continue
+        days_since_last = (today - dates[-1]).days
+        if days_since_last - cadence > CADENCE_BUFFER_DAYS:
+            alerts.append({
+                "item_id": item_id,
+                "name": name_by_item[item_id],
+                "last_ordered": dates[-1].isoformat(),
+                "days_since_last": days_since_last,
+                "typical_cadence_days": round(cadence, 1),
+                "order_count": len(dates),
+            })
+    alerts.sort(key=lambda a: a["days_since_last"] - a["typical_cadence_days"], reverse=True)
+    return alerts
+
+
+CADENCE_NUDGE_INSTRUCTION = """The following Instamart items appear to be running low based on the household's order cadence. Compose ONE short proactive message in Remy's voice (3 sentences max) flagging the most relevant 1-3 items. Mention the specific items and roughly how overdue each is ("milk's been 6 days, usually you order every 4"). End with a soft "want me to draft a cart?" or similar — never assume yes, never stage anything yourself.
+
+Hard rules:
+- NO em-dashes, NO markdown asterisks, NO bullet hyphens (same voice rules as elsewhere).
+- If more than 3 items are listed, pick the top 1-3 by how overdue they are. Don't dump the whole list.
+- One opening line, then the items woven naturally, then the soft ask. Don't write headers.
+- Stay in Remy's sensory, specific voice.
+
+Items running low (JSON):
+"""
+
+
+async def check_cadence_for_chat(chat_id: int) -> str | None:
+    """Fetch orders, compute cadence alerts, and ask Remy to phrase a nudge.
+    Returns None when nothing is due (cron stays silent) or when Swiggy fails."""
+    try:
+        payload = await swiggy_mcp.call_tool("get_orders", {"count": 20})
+    except Exception:
+        logger.exception("cadence: get_orders failed")
+        return None
+    if not payload.get("success"):
+        logger.info(f"cadence: get_orders returned error: {(payload.get('error') or {}).get('message')}")
+        return None
+
+    orders = (payload.get("data") or {}).get("orders") or []
+    alerts = _compute_cadence_alerts(orders)
+    if not alerts:
+        return None
+
+    household_context = build_household_context(chat_id)
+    instruction = CADENCE_NUDGE_INSTRUCTION + json.dumps(alerts[:5], ensure_ascii=False)
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=512,
+        system=[
+            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": household_context},
+        ],
+        messages=[{"role": "user", "content": instruction}],
+    )
+    raw = "".join(b.text for b in response.content if b.type == "text").strip()
+    return _strip_formatting(raw)

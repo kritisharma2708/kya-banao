@@ -126,6 +126,22 @@ async def send_weekly_plan(context: ContextTypes.DEFAULT_TYPE):
             logger.exception(f"Failed to send weekly plan to {chat_id}: {e}")
 
 
+async def send_cadence_nudge(context: ContextTypes.DEFAULT_TYPE):
+    """Daily 9 AM IST cron: ping each household chat ONLY if something looks
+    overdue based on Instamart order cadence. Stays silent otherwise."""
+    chat_ids = db.get_chat_ids_with_onboarded_users()
+    logger.info(f"Cadence check firing for {len(chat_ids)} chat(s)")
+    for chat_id in chat_ids:
+        try:
+            nudge = await llm.check_cadence_for_chat(chat_id)
+            if not nudge:
+                continue
+            await context.bot.send_message(chat_id=chat_id, text=nudge)
+            db.save_message(chat_id, "assistant", nudge, user_name=None)
+        except Exception as e:
+            logger.exception(f"Cadence nudge failed for {chat_id}: {e}")
+
+
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -166,6 +182,14 @@ def build_app() -> Application:
         name="weekly_plan",
     )
     logger.info("Scheduled weekly_plan cron for Sunday 18:00 IST")
+
+    # Daily 9 AM IST cadence nudge — silent if nothing's due
+    app.job_queue.run_daily(
+        callback=send_cadence_nudge,
+        time=dt_time(hour=9, minute=0, tzinfo=IST),
+        name="cadence_nudge",
+    )
+    logger.info("Scheduled cadence_nudge cron for daily 09:00 IST")
 
     return app
 
