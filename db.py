@@ -89,6 +89,17 @@ def init_db():
             );
 
             CREATE INDEX IF NOT EXISTS idx_facts_chat ON household_facts(chat_id);
+
+            CREATE TABLE IF NOT EXISTS weekly_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                week_start DATE NOT NULL,
+                plan_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, week_start)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_weekly_plans_chat ON weekly_plans(chat_id, week_start);
         """)
 
         # Migrations: cook_events originally had no chat_id/notes columns
@@ -250,3 +261,45 @@ def get_upcoming_cook_events(chat_id: int, days_ahead: int = 21):
             ORDER BY event_date
         """, (chat_id, today, cutoff)).fetchall()
         return [dict(r) for r in rows]
+
+
+def save_weekly_plan(chat_id: int, week_start: str, plan: dict):
+    """Store the structured weekly plan. week_start is ISO date (YYYY-MM-DD).
+    Replaces any existing plan for the same chat+week_start."""
+    with conn() as c:
+        c.execute("""
+            INSERT INTO weekly_plans (chat_id, week_start, plan_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id, week_start) DO UPDATE SET
+                plan_json = excluded.plan_json,
+                created_at = CURRENT_TIMESTAMP
+        """, (chat_id, week_start, json.dumps(plan, ensure_ascii=False)))
+
+
+def get_meals_for_date(chat_id: int, day: str) -> dict | None:
+    """Return {breakfast, lunch, dinner} for a given ISO date, drawing from
+    whichever weekly plan covers it. Returns None if no plan covers this day."""
+    with conn() as c:
+        rows = c.execute("""
+            SELECT plan_json FROM weekly_plans
+            WHERE chat_id = ?
+            ORDER BY week_start DESC
+            LIMIT 5
+        """, (chat_id,)).fetchall()
+    for r in rows:
+        plan = json.loads(r["plan_json"])
+        meals = (plan.get("dates") or {}).get(day)
+        if meals:
+            return meals
+    return None
+
+
+def get_latest_weekly_plan(chat_id: int) -> dict | None:
+    """Return the most recent stored weekly plan, or None."""
+    with conn() as c:
+        row = c.execute("""
+            SELECT plan_json FROM weekly_plans
+            WHERE chat_id = ?
+            ORDER BY week_start DESC LIMIT 1
+        """, (chat_id,)).fetchone()
+    return json.loads(row["plan_json"]) if row else None

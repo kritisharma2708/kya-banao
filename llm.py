@@ -157,6 +157,38 @@ TOOLS = [
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "instamart_stage_weekly_groceries",
+        "description": (
+            "Stage many grocery items at once — designed for building the weekly cart after Kriti approves the meal plan. "
+            "For each query, searches Instamart, picks the best in-stock variation, and stages everything in a single cart "
+            "update. Returns: 'resolved' (items found and staged), 'not_found' (queries with no in-stock match), and the "
+            "stage verify result. ALWAYS read both fields and report not_found items by name — don't pretend they got added."
+            "\n\n"
+            "Use ONLY after Kriti explicitly approves the weekly plan ('looks good', 'go ahead', 'build the cart'). Never "
+            "stage proactively. Before calling, you must construct a clean deduplicated grocery list from the plan: combine "
+            "ingredients across meals (paneer mentioned in 3 dinners = 1 entry, not 3), skip pantry staples Kriti already has "
+            "(check instamart_recent_orders if helpful), and add size hints to queries when they matter ('paneer 200g', 'milk 1L')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "Deduplicated grocery list to stage in one shot.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Ingredient + optional brand/size, e.g. 'Nandini toned milk 1L', 'Amul ghee 500g', 'paneer 200g'."},
+                            "quantity": {"type": "number", "description": "How many packs to add. Defaults to 1."},
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    },
 ]
 
 
@@ -246,6 +278,11 @@ async def _execute_tool_inner(chat_id: int, name: str, args: dict) -> str:
             return _compact(payload)
         except Exception as e:
             return f"Couldn't clear cart: {e}"
+    if name == "instamart_stage_weekly_groceries":
+        try:
+            return await _stage_weekly_groceries(args.get("items") or [])
+        except Exception as e:
+            return f"Couldn't stage weekly groceries: {e}"
     return f"Unknown tool: {name}"
 
 
@@ -496,9 +533,113 @@ def _strip_formatting(text: str) -> str:
     return text.strip()
 
 
+async def _stage_weekly_groceries(items: list[dict]) -> str:
+    """Search-and-stage a deduplicated grocery list in one tool call.
+    For each query: search Instamart, pick the first in-stock variation of
+    the first in-stock product, collect spinIds, hand to _stage_cart for the
+    actual update + verify."""
+    if not items:
+        return json.dumps({"error": "no items provided"})
+
+    resolved: list[dict] = []
+    not_found: list[dict] = []
+
+    for it in items:
+        query = (it.get("query") or "").strip()
+        if not query:
+            continue
+        qty = it.get("quantity") or 1
+        try:
+            search_payload = await swiggy_mcp.call_tool(
+                "search_products",
+                {"addressId": SWIGGY_DEFAULT_ADDRESS_ID, "query": query},
+            )
+        except Exception as e:
+            not_found.append({"query": query, "reason": f"search failed: {e}"})
+            continue
+        if not search_payload.get("success"):
+            not_found.append({
+                "query": query,
+                "reason": (search_payload.get("error") or {}).get("message", "search returned no success"),
+            })
+            continue
+
+        products = (search_payload.get("data") or {}).get("products") or []
+        chosen = None
+        for p in products:
+            if not p.get("inStock"):
+                continue
+            for v in p.get("variations") or []:
+                if v.get("isInStockAndAvailable"):
+                    chosen = (p, v)
+                    break
+            if chosen:
+                break
+        if not chosen:
+            not_found.append({"query": query, "reason": "no in-stock matches"})
+            continue
+        p, v = chosen
+        resolved.append({
+            "spinId": v["spinId"],
+            "quantity": qty,
+            "name": f"{p.get('displayName')} ({v.get('quantityDescription')})",
+        })
+
+    if not resolved:
+        return json.dumps({
+            "resolved": [],
+            "not_found": not_found,
+            "stage_result": None,
+            "warning": "Nothing on the list was found on Instamart. Tell Kriti by name what's missing.",
+        }, ensure_ascii=False)[:4000]
+
+    stage_raw = await _stage_cart(resolved)
+    stage_result = json.loads(stage_raw)
+    return json.dumps({
+        "resolved_count": len(resolved),
+        "not_found": not_found,
+        "stage_result": stage_result,
+        "warning": (
+            f"{len(not_found)} item(s) couldn't be found on Instamart — name them to Kriti. "
+            "Also relay anything in stage_result.dropped_by_swiggy."
+        ) if not_found else None,
+    }, ensure_ascii=False)[:4000]
+
+
+PLAN_EXTRACTION_INSTRUCTION = """Below is a 7-day meal plan for an Indian household.
+Extract a JSON object with this exact shape, nothing else:
+
+{"dates": {"YYYY-MM-DD": {"breakfast": "...", "lunch": "...", "dinner": "..."}, ...}}
+
+Rules:
+- Keys are ISO dates, exactly as they appear in the plan.
+- Each meal value is a short phrase (the actual dish), not a paragraph.
+- Strip any leading bullets, "Breakfast:" labels, em-dashes, asterisks, etc.
+- If a day mentions a discovery suggestion or sign-off, ignore those — only the 3 daily meals.
+- Return ONLY the JSON. No prose before or after.
+
+Meal plan text:
+"""
+
+
+async def _extract_structured_plan(plan_text: str) -> dict:
+    """Second LLM pass: turn the voiced weekly plan into structured per-day JSON.
+    Used to power the daily morning menu reminder."""
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": PLAN_EXTRACTION_INSTRUCTION + plan_text}],
+    )
+    raw = "".join(b.text for b in response.content if b.type == "text").strip()
+    # Strip code fences if Claude adds them despite the instruction
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw)
+
+
 async def generate_weekly_plan(chat_id: int) -> str:
     household_context = build_household_context(chat_id)
-    week_block, _ = _format_week_block()
+    week_block, plan_start = _format_week_block()
     instruction = WEEKLY_PLAN_INSTRUCTION + "\n\n" + week_block
     response = await client.messages.create(
         model=MODEL,
@@ -511,7 +652,39 @@ async def generate_weekly_plan(chat_id: int) -> str:
         messages=[{"role": "user", "content": instruction}],
     )
     raw = "".join(b.text for b in response.content if b.type == "text").strip()
-    return _strip_formatting(raw)
+    voiced = _strip_formatting(raw)
+
+    # Capture structured version for the daily menu reminder. If extraction
+    # fails, log and proceed — we don't want to lose the voiced plan over
+    # a parsing hiccup.
+    try:
+        structured = await _extract_structured_plan(voiced)
+        db.save_weekly_plan(chat_id, plan_start.isoformat(), structured)
+        logger.info(f"Saved structured weekly plan for {chat_id}, week starting {plan_start}")
+    except Exception:
+        logger.exception("Failed to extract/save structured weekly plan")
+
+    return voiced
+
+
+async def format_daily_menu_for_chat(chat_id: int, today: date | None = None) -> str | None:
+    """Look up today's meals from the latest weekly plan and return a short
+    reminder in Remy's voice. Returns None if no plan covers today (cron
+    stays silent)."""
+    today = today or date.today()
+    meals = db.get_meals_for_date(chat_id, today.isoformat())
+    if not meals:
+        return None
+    day_name = today.strftime("%A")
+    b = meals.get("breakfast") or "(open)"
+    l = meals.get("lunch") or "(open)"
+    d = meals.get("dinner") or "(open)"
+    return (
+        f"Today on the plate, {day_name}.\n"
+        f"Breakfast: {b}.\n"
+        f"Lunch: {l}.\n"
+        f"Dinner: {d}."
+    )
 
 
 async def respond(chat_id: int, user_name: str, message: str) -> str:

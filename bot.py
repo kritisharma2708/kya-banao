@@ -126,6 +126,22 @@ async def send_weekly_plan(context: ContextTypes.DEFAULT_TYPE):
             logger.exception(f"Failed to send weekly plan to {chat_id}: {e}")
 
 
+async def send_daily_menu(context: ContextTypes.DEFAULT_TYPE):
+    """Daily 8 AM IST cron: post today's planned meals to each household chat.
+    Silent if no weekly plan covers today (e.g., last Sunday's plan expired)."""
+    chat_ids = db.get_chat_ids_with_onboarded_users()
+    logger.info(f"Daily menu firing for {len(chat_ids)} chat(s)")
+    for chat_id in chat_ids:
+        try:
+            reminder = await llm.format_daily_menu_for_chat(chat_id)
+            if not reminder:
+                continue
+            await context.bot.send_message(chat_id=chat_id, text=reminder)
+            db.save_message(chat_id, "assistant", reminder, user_name=None)
+        except Exception as e:
+            logger.exception(f"Daily menu failed for {chat_id}: {e}")
+
+
 async def send_cadence_nudge(context: ContextTypes.DEFAULT_TYPE):
     """Daily 9 AM IST cron: ping each household chat ONLY if something looks
     overdue based on Instamart order cadence. Stays silent otherwise."""
@@ -182,6 +198,14 @@ def build_app() -> Application:
         name="weekly_plan",
     )
     logger.info("Scheduled weekly_plan cron for Sunday 18:00 IST")
+
+    # Daily 8 AM IST menu reminder — silent if no plan covers today
+    app.job_queue.run_daily(
+        callback=send_daily_menu,
+        time=dt_time(hour=8, minute=0, tzinfo=IST),
+        name="daily_menu",
+    )
+    logger.info("Scheduled daily_menu cron for daily 08:00 IST")
 
     # Daily 9 AM IST cadence nudge — silent if nothing's due
     app.job_queue.run_daily(
