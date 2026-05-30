@@ -44,18 +44,21 @@ class FileTokenStorage(TokenStorage):
 
     def _bootstrap_from_env(self) -> None:
         if self.path.exists():
+            print(f"[swiggy_login] tokens file already at {self.path}, skipping env-var seed", flush=True)
             return
         seed = os.getenv("SWIGGY_TOKENS_JSON")
         if not seed:
+            print(f"[swiggy_login] no tokens at {self.path} and SWIGGY_TOKENS_JSON env var not set", flush=True)
             return
-        # Validate it parses before writing
         try:
             json.loads(seed)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"[swiggy_login] SWIGGY_TOKENS_JSON is malformed ({e}), not seeding. Length={len(seed)}, first 40 chars={seed[:40]!r}", flush=True)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(seed)
         os.chmod(self.path, 0o600)
+        print(f"[swiggy_login] seeded {self.path} from SWIGGY_TOKENS_JSON env var ({len(seed)} bytes)", flush=True)
 
     def _read(self) -> dict:
         if not self.path.exists():
