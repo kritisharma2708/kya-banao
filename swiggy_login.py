@@ -26,14 +26,36 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAu
 SWIGGY_MCP_URL = "https://mcp.swiggy.com/im"
 CALLBACK_PORT = 8765
 REDIRECT_URI = f"http://127.0.0.1:{CALLBACK_PORT}/callback"
-TOKENS_FILE = Path(__file__).parent / ".swiggy_tokens.json"
+# Tokens path is env-var configurable so Railway can point at the persistent
+# volume (e.g. SWIGGY_TOKENS_PATH=/data/.swiggy_tokens.json).
+TOKENS_FILE = Path(os.getenv("SWIGGY_TOKENS_PATH", str(Path(__file__).parent / ".swiggy_tokens.json")))
 
 
 class FileTokenStorage(TokenStorage):
-    """Persists OAuth tokens and dynamic-registration client info to one JSON file."""
+    """Persists OAuth tokens and dynamic-registration client info to one JSON file.
+
+    Railway bootstrap: if the file doesn't exist but SWIGGY_TOKENS_JSON env var
+    is set, write that JSON to disk on first read. Lets Kriti paste tokens once
+    via Railway dashboard after a fresh laptop re-auth."""
 
     def __init__(self, path: Path):
         self.path = path
+        self._bootstrap_from_env()
+
+    def _bootstrap_from_env(self) -> None:
+        if self.path.exists():
+            return
+        seed = os.getenv("SWIGGY_TOKENS_JSON")
+        if not seed:
+            return
+        # Validate it parses before writing
+        try:
+            json.loads(seed)
+        except json.JSONDecodeError:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(seed)
+        os.chmod(self.path, 0o600)
 
     def _read(self) -> dict:
         if not self.path.exists():
@@ -41,6 +63,7 @@ class FileTokenStorage(TokenStorage):
         return json.loads(self.path.read_text())
 
     def _write(self, data: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(data, indent=2, default=str))
         os.chmod(self.path, 0o600)
 
