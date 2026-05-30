@@ -90,12 +90,15 @@ def _unwrap(result: Any) -> dict[str, Any]:
 
 async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     """Call an Instamart MCP tool and return the unwrapped Swiggy payload."""
+    # Build auth first — FileTokenStorage's init runs the Railway env-var
+    # bootstrap, which may create the tokens file from SWIGGY_TOKENS_JSON.
+    # Only then check whether tokens actually exist on disk.
+    auth = _build_auth()
     if not TOKENS_FILE.exists():
         raise SwiggyAuthRequired(
             f"No tokens at {TOKENS_FILE}. Run `python swiggy_login.py` first."
         )
 
-    auth = _build_auth()
     async with streamablehttp_client(SWIGGY_MCP_URL, auth=auth) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
