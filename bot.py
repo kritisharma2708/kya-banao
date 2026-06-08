@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from datetime import time as dt_time, timezone, timedelta
 from dotenv import load_dotenv
@@ -158,8 +159,32 @@ async def send_cadence_nudge(context: ContextTypes.DEFAULT_TYPE):
             logger.exception(f"Cadence nudge failed for {chat_id}: {e}")
 
 
+def _remy_is_addressed(update: Update, bot_username: str | None) -> bool:
+    """In group chats, Remy should stay quiet unless he's actually being
+    talked to. Returns True if any of:
+      - message starts with "Remy" (case-insensitive)
+      - message is a reply to one of Remy's own messages
+      - bot is @-mentioned in the message
+    In private DMs, always returns True."""
+    msg = update.message
+    chat = update.effective_chat
+    if chat.type == "private":
+        return True
+    text = (msg.text or "").strip()
+    if re.match(r"(?i)^remy\b", text):
+        return True
+    if bot_username and f"@{bot_username}".lower() in text.lower():
+        return True
+    reply = msg.reply_to_message
+    if reply and reply.from_user and reply.from_user.is_bot:
+        return True
+    return False
+
+
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
+        return
+    if not _remy_is_addressed(update, context.bot.username):
         return
     chat = update.effective_chat
     user = update.effective_user
