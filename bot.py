@@ -67,6 +67,24 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"(Couldn't generate plan: {e})")
 
 
+async def discovery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual trigger: generate this week's discovery nudge on demand."""
+    chat = update.effective_chat
+    try:
+        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+        nudge = await llm.generate_weekly_discovery(chat.id)
+        if not nudge:
+            await update.message.reply_text(
+                "(Nothing fresh surfaced this week. Could be Swiggy hiccuping or order history too thin. Try again later.)"
+            )
+            return
+        await update.message.reply_text(nudge)
+        db.save_message(chat.id, "assistant", nudge, user_name=None)
+    except Exception as e:
+        logger.exception("Discovery error")
+        await update.message.reply_text(f"(Discovery hit an error: {e})")
+
+
 def _render_staples(payload: dict) -> str:
     products = (payload.get("data") or {}).get("products") or []
     if not products:
@@ -143,6 +161,23 @@ async def send_daily_menu(context: ContextTypes.DEFAULT_TYPE):
             logger.exception(f"Daily menu failed for {chat_id}: {e}")
 
 
+async def send_weekly_discovery(context: ContextTypes.DEFAULT_TYPE):
+    """Wednesday 7 PM IST cron: surface one new thing to try this week,
+    grounded in order history, recent plans, season, and any queued friend
+    recommendations. Silent on weeks where nothing fresh emerges."""
+    chat_ids = db.get_chat_ids_with_onboarded_users()
+    logger.info(f"Discovery firing for {len(chat_ids)} chat(s)")
+    for chat_id in chat_ids:
+        try:
+            nudge = await llm.generate_weekly_discovery(chat_id)
+            if not nudge:
+                continue
+            await context.bot.send_message(chat_id=chat_id, text=nudge)
+            db.save_message(chat_id, "assistant", nudge, user_name=None)
+        except Exception as e:
+            logger.exception(f"Discovery failed for {chat_id}: {e}")
+
+
 async def send_cadence_nudge(context: ContextTypes.DEFAULT_TYPE):
     """Daily 9 AM IST cron: ping each household chat ONLY if something looks
     overdue based on Instamart order cadence. Stays silent otherwise."""
@@ -212,6 +247,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("plan", plan_command))
+    app.add_handler(CommandHandler("discovery", discovery_command))
     app.add_handler(CommandHandler("staples", staples))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
 
@@ -239,6 +275,15 @@ def build_app() -> Application:
         name="cadence_nudge",
     )
     logger.info("Scheduled cadence_nudge cron for daily 09:00 IST")
+
+    # Wednesday 7 PM IST discovery nudge — one novel suggestion mid-week
+    app.job_queue.run_daily(
+        callback=send_weekly_discovery,
+        time=dt_time(hour=19, minute=0, tzinfo=IST),
+        days=(2,),  # 0=Mon..2=Wed..6=Sun
+        name="weekly_discovery",
+    )
+    logger.info("Scheduled weekly_discovery cron for Wednesday 19:00 IST")
 
     return app
 

@@ -100,6 +100,20 @@ def init_db():
             );
 
             CREATE INDEX IF NOT EXISTS idx_weekly_plans_chat ON weekly_plans(chat_id, week_start);
+
+            CREATE TABLE IF NOT EXISTS friend_recommendations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                item TEXT NOT NULL,
+                source TEXT,
+                notes TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                consumed_at TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_friend_recs_chat_status
+                ON friend_recommendations(chat_id, status);
         """)
 
         # Migrations: cook_events originally had no chat_id/notes columns
@@ -303,3 +317,49 @@ def get_latest_weekly_plan(chat_id: int) -> dict | None:
             ORDER BY week_start DESC LIMIT 1
         """, (chat_id,)).fetchone()
     return json.loads(row["plan_json"]) if row else None
+
+
+def get_recent_weekly_plans(chat_id: int, limit: int = 2) -> list[dict]:
+    """Return up to `limit` recent weekly plans, newest first."""
+    with conn() as c:
+        rows = c.execute("""
+            SELECT plan_json FROM weekly_plans
+            WHERE chat_id = ?
+            ORDER BY week_start DESC LIMIT ?
+        """, (chat_id, limit)).fetchall()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r["plan_json"]))
+        except Exception:
+            continue
+    return out
+
+
+def add_friend_recommendation(chat_id: int, item: str, source: str = "", notes: str = ""):
+    """Queue a friend/family recommendation for the weekly discovery nudge."""
+    with conn() as c:
+        c.execute("""
+            INSERT INTO friend_recommendations (chat_id, item, source, notes)
+            VALUES (?, ?, ?, ?)
+        """, (chat_id, item, source or None, notes or None))
+
+
+def get_pending_friend_recs(chat_id: int, limit: int = 5):
+    with conn() as c:
+        rows = c.execute("""
+            SELECT id, item, source, notes, created_at
+            FROM friend_recommendations
+            WHERE chat_id = ? AND status = 'pending'
+            ORDER BY id ASC LIMIT ?
+        """, (chat_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_friend_rec_consumed(rec_id: int):
+    with conn() as c:
+        c.execute("""
+            UPDATE friend_recommendations
+            SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (rec_id,))

@@ -57,6 +57,35 @@ TOOLS = [
         },
     },
     {
+        "name": "add_friend_recommendation",
+        "description": (
+            "Queue a food/restaurant/dish recommendation from a friend, family member, or coworker so it surfaces "
+            "in the household's weekly discovery nudge. Call this when someone in chat mentions an external recommendation "
+            "Kriti or Navneet might want to try later. Examples: 'Asif said try the Burmese place in Indiranagar', "
+            "'mom recommended Sakshi's matar paneer', 'Dhaval keeps raving about the kombucha at Blue Tokai'. "
+            "Always include the source (who recommended) when known — it gives the suggestion context. "
+            "Do NOT use for the user's own ideas or things they've already tried."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item": {
+                    "type": "string",
+                    "description": "What was recommended: dish, restaurant, snack, cuisine, product, etc.",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Who recommended it (first name or relationship). Empty string if unknown.",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Brief context: why they liked it, where it's from, when it was mentioned. Empty string if none.",
+                },
+            },
+            "required": ["item"],
+        },
+    },
+    {
         "name": "remember",
         "description": (
             "Save a durable, household-level fact that should be remembered forever, not just for this conversation. "
@@ -238,6 +267,18 @@ async def _execute_tool_inner(chat_id: int, name: str, args: dict) -> str:
             return f"Saved fact: {args['fact']}"
         except Exception as e:
             return f"Failed to save fact: {e}"
+    if name == "add_friend_recommendation":
+        try:
+            db.add_friend_recommendation(
+                chat_id,
+                args["item"],
+                args.get("source", ""),
+                args.get("notes", ""),
+            )
+            who = args.get("source") or "someone"
+            return f"Queued rec from {who}: {args['item']}"
+        except Exception as e:
+            return f"Failed to save recommendation: {e}"
     if name == "instamart_go_to_items":
         try:
             payload = await swiggy_mcp.call_tool(
@@ -836,3 +877,82 @@ async def check_cadence_for_chat(chat_id: int) -> str | None:
     )
     raw = "".join(b.text for b in response.content if b.type == "text").strip()
     return _strip_formatting(raw)
+
+
+# -----------------------------------------------------------------------------
+# Discovery engine: weekly nudge to try something new.
+# -----------------------------------------------------------------------------
+
+DISCOVERY_INSTRUCTION = """Time for the weekly discovery nudge. Suggest exactly ONE new thing the household should try this week. Could be a snack, a produce item, a dish to cook, a cuisine to revisit, or a restaurant style. It must be GROUNDED in the data below — don't invent generic suggestions.
+
+Hard rules:
+- Must respect household dietary constraints. If anyone is eggetarian/vegetarian/vegan, NEVER suggest meat or fish.
+- Must NOT appear in the household's recent orders list below. The whole point is novelty.
+- If a friend recommendation is queued, lead with that (mention who recommended it, use the source field).
+- Consider Indian seasonality (today's date is in your context). Bangalore in late spring = mangoes (Alphonso/Banganapalli winding down, Kesar arriving), jamun starting, fresh tender coconut. Monsoon = corn, mushrooms, leafy greens. Winter = strawberries, oranges, root veg. Use seasonality when it actually fits.
+- Short and specific. 2-4 sentences max. Name the thing concretely, say WHY it fits, and close with a soft offer ("want me to find it on Instamart?" or "want me to weave this into the weekend plan?").
+
+Hard formatting rules:
+- NO em-dashes (—) anywhere.
+- NO markdown asterisks.
+- NO bullet hyphens at the start of lines.
+- Stay in Remy's sensory, specific voice.
+
+Below: dietary constraints, last 30 days of order history, the last 2 weekly plans (so you don't repeat dishes), pending friend recommendations, and today's date.
+"""
+
+
+async def generate_weekly_discovery(chat_id: int) -> str | None:
+    """Pull recent orders + plans + friend recs, ask Remy to phrase ONE novel
+    suggestion. Returns None on failure or if Swiggy is unreachable."""
+    pending_recs = db.get_pending_friend_recs(chat_id, limit=3)
+
+    try:
+        orders_payload = await swiggy_mcp.call_tool("get_orders", {"count": 20})
+    except Exception:
+        logger.exception("discovery: get_orders failed")
+        return None
+    if not orders_payload.get("success"):
+        logger.info(f"discovery: get_orders error: {(orders_payload.get('error') or {}).get('message')}")
+        return None
+    orders = (orders_payload.get("data") or {}).get("orders") or []
+
+    # Compact order history: just dates + item names
+    compact_orders = []
+    for o in orders[:20]:
+        items = [it.get("name") for it in (o.get("items") or []) if it.get("name")]
+        compact_orders.append({"date": (o.get("createdAt") or "")[:10], "items": items})
+
+    recent_plans = db.get_recent_weekly_plans(chat_id, limit=2)
+
+    payload = {
+        "today": date.today().isoformat(),
+        "pending_friend_recommendations": pending_recs,
+        "recent_orders_last_15_days": compact_orders,
+        "last_two_weekly_plans": recent_plans,
+    }
+
+    household_context = build_household_context(chat_id)
+    instruction = DISCOVERY_INSTRUCTION + "\n\n" + json.dumps(payload, ensure_ascii=False, default=str)[:6000]
+
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=512,
+        system=[
+            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": household_context},
+        ],
+        messages=[{"role": "user", "content": instruction}],
+    )
+    raw = "".join(b.text for b in response.content if b.type == "text").strip()
+    voiced = _strip_formatting(raw)
+    if not voiced:
+        return None
+
+    # If a pending friend rec was the basis, mark the first as consumed so we
+    # don't surface it again next week.
+    if pending_recs:
+        db.mark_friend_rec_consumed(pending_recs[0]["id"])
+
+    return voiced
