@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 client = AsyncAnthropic()
 MODEL = "claude-sonnet-4-6"
-SWIGGY_DEFAULT_ADDRESS_ID = os.getenv("SWIGGY_DEFAULT_ADDRESS_ID")
 
 PROJECT_DIR = Path(__file__).parent
 SOUL = (PROJECT_DIR / "soul.md").read_text()
@@ -281,50 +280,63 @@ async def _execute_tool_inner(chat_id: int, name: str, args: dict) -> str:
             return f"Failed to save recommendation: {e}"
     if name == "instamart_go_to_items":
         try:
+            address_id = db.get_default_address(chat_id)
+            if not address_id:
+                return _NO_ADDRESS_HINT
             payload = await swiggy_mcp.call_tool(
-                "your_go_to_items", {"addressId": SWIGGY_DEFAULT_ADDRESS_ID}
+                chat_id, "your_go_to_items", {"addressId": address_id}
             )
             return _summarize_go_to(payload)
         except Exception as e:
             return f"Couldn't reach Instamart go-to items: {e}"
     if name == "instamart_recent_orders":
         try:
-            payload = await swiggy_mcp.call_tool("get_orders", {})
+            payload = await swiggy_mcp.call_tool(chat_id, "get_orders", {})
             return _compact(payload)
         except Exception as e:
             return f"Couldn't reach Instamart order history: {e}"
     if name == "instamart_search":
         try:
+            address_id = db.get_default_address(chat_id)
+            if not address_id:
+                return _NO_ADDRESS_HINT
             payload = await swiggy_mcp.call_tool(
+                chat_id,
                 "search_products",
-                {"addressId": SWIGGY_DEFAULT_ADDRESS_ID, "query": args["query"]},
+                {"addressId": address_id, "query": args["query"]},
             )
             return _compact(payload)
         except Exception as e:
             return f"Couldn't search Instamart: {e}"
     if name == "instamart_cart":
         try:
-            payload = await swiggy_mcp.call_tool("get_cart", {})
+            payload = await swiggy_mcp.call_tool(chat_id, "get_cart", {})
             return _compact(payload)
         except Exception as e:
             return f"Couldn't reach Instamart cart: {e}"
     if name == "instamart_stage_cart":
         try:
-            return await _stage_cart(args.get("items") or [])
+            return await _stage_cart(chat_id, args.get("items") or [])
         except Exception as e:
             return f"Couldn't stage cart: {e}"
     if name == "instamart_clear_cart":
         try:
-            payload = await swiggy_mcp.call_tool("clear_cart", {})
+            payload = await swiggy_mcp.call_tool(chat_id, "clear_cart", {})
             return _compact(payload)
         except Exception as e:
             return f"Couldn't clear cart: {e}"
     if name == "instamart_stage_weekly_groceries":
         try:
-            return await _stage_weekly_groceries(args.get("items") or [])
+            return await _stage_weekly_groceries(chat_id, args.get("items") or [])
         except Exception as e:
             return f"Couldn't stage weekly groceries: {e}"
     return f"Unknown tool: {name}"
+
+
+_NO_ADDRESS_HINT = (
+    "This household hasn't set a default Instamart delivery address yet. "
+    "Tell Kriti to run /set_address — I'll show the addresses on file and she picks one."
+)
 
 
 def _existing_cart_items(get_cart_payload: dict) -> list[dict]:
@@ -344,7 +356,7 @@ def _existing_cart_items(get_cart_payload: dict) -> list[dict]:
     return extracted
 
 
-async def _stage_cart(new_items: list[dict]) -> str:
+async def _stage_cart(chat_id: int, new_items: list[dict]) -> str:
     """Merge new_items with existing cart, call update_cart, verify via the
     update_cart response itself (its data.items is the resulting cart state).
     Resilient when get_cart fails on Swiggy's side — proceeds without merge
@@ -352,7 +364,11 @@ async def _stage_cart(new_items: list[dict]) -> str:
     if not new_items:
         return json.dumps({"error": "no items provided"})
 
-    get_payload = await swiggy_mcp.call_tool("get_cart", {})
+    address_id = db.get_default_address(chat_id)
+    if not address_id:
+        return _NO_ADDRESS_HINT
+
+    get_payload = await swiggy_mcp.call_tool(chat_id, "get_cart", {})
     get_cart_ok = bool(get_payload.get("success"))
     existing = _existing_cart_items(get_payload) if get_cart_ok else []
 
@@ -367,18 +383,19 @@ async def _stage_cart(new_items: list[dict]) -> str:
     # MCP layer but the mobile app doesn't show new items. Clearing first makes
     # the app sync properly. Tested 2026-05-21.
     if existing:
-        await swiggy_mcp.call_tool("clear_cart", {})
+        await swiggy_mcp.call_tool(chat_id, "clear_cart", {})
 
     update_payload = await swiggy_mcp.call_tool(
+        chat_id,
         "update_cart",
-        {"selectedAddressId": SWIGGY_DEFAULT_ADDRESS_ID, "items": merged_list},
+        {"selectedAddressId": address_id, "items": merged_list},
     )
 
     # Verify via a follow-up get_cart — update_cart's response is sometimes a
     # lie (claims items landed when they actually didn't). get_cart is the
     # ground truth when it works. Fall back to update_cart's own response if
     # get_cart is failing.
-    verify_payload = await swiggy_mcp.call_tool("get_cart", {})
+    verify_payload = await swiggy_mcp.call_tool(chat_id, "get_cart", {})
     if verify_payload.get("success"):
         actual = _existing_cart_items(verify_payload)
         verify_source = "get_cart"
@@ -574,13 +591,17 @@ def _strip_formatting(text: str) -> str:
     return text.strip()
 
 
-async def _stage_weekly_groceries(items: list[dict]) -> str:
+async def _stage_weekly_groceries(chat_id: int, items: list[dict]) -> str:
     """Search-and-stage a deduplicated grocery list in one tool call.
     For each query: search Instamart, pick the first in-stock variation of
     the first in-stock product, collect spinIds, hand to _stage_cart for the
     actual update + verify."""
     if not items:
         return json.dumps({"error": "no items provided"})
+
+    address_id = db.get_default_address(chat_id)
+    if not address_id:
+        return _NO_ADDRESS_HINT
 
     resolved: list[dict] = []
     not_found: list[dict] = []
@@ -592,8 +613,9 @@ async def _stage_weekly_groceries(items: list[dict]) -> str:
         qty = it.get("quantity") or 1
         try:
             search_payload = await swiggy_mcp.call_tool(
+                chat_id,
                 "search_products",
-                {"addressId": SWIGGY_DEFAULT_ADDRESS_ID, "query": query},
+                {"addressId": address_id, "query": query},
             )
         except Exception as e:
             not_found.append({"query": query, "reason": f"search failed: {e}"})
@@ -634,7 +656,7 @@ async def _stage_weekly_groceries(items: list[dict]) -> str:
             "warning": "Nothing on the list was found on Instamart. Tell Kriti by name what's missing.",
         }, ensure_ascii=False)[:4000]
 
-    stage_raw = await _stage_cart(resolved)
+    stage_raw = await _stage_cart(chat_id, resolved)
     stage_result = json.loads(stage_raw)
     return json.dumps({
         "resolved_count": len(resolved),
@@ -850,7 +872,7 @@ async def check_cadence_for_chat(chat_id: int) -> str | None:
     """Fetch orders, compute cadence alerts, and ask Remy to phrase a nudge.
     Returns None when nothing is due (cron stays silent) or when Swiggy fails."""
     try:
-        payload = await swiggy_mcp.call_tool("get_orders", {"count": 20})
+        payload = await swiggy_mcp.call_tool(chat_id, "get_orders", {"count": 20})
     except Exception:
         logger.exception("cadence: get_orders failed")
         return None
@@ -908,7 +930,7 @@ async def generate_weekly_discovery(chat_id: int) -> str | None:
     pending_recs = db.get_pending_friend_recs(chat_id, limit=3)
 
     try:
-        orders_payload = await swiggy_mcp.call_tool("get_orders", {"count": 20})
+        orders_payload = await swiggy_mcp.call_tool(chat_id, "get_orders", {"count": 20})
     except Exception:
         logger.exception("discovery: get_orders failed")
         return None

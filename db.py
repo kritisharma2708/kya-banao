@@ -114,6 +114,23 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_friend_recs_chat_status
                 ON friend_recommendations(chat_id, status);
+
+            -- Multi-tenant: per-chat OAuth tokens, replacing the global
+            -- .swiggy_tokens.json file. One row per household chat.
+            CREATE TABLE IF NOT EXISTS tenant_tokens (
+                chat_id INTEGER PRIMARY KEY,
+                tokens_json TEXT,
+                client_info_json TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Multi-tenant: per-chat settings (default Instamart address,
+            -- future per-chat config). One row per household chat.
+            CREATE TABLE IF NOT EXISTS tenant_settings (
+                chat_id INTEGER PRIMARY KEY,
+                default_address_id TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
 
         # Migrations: cook_events originally had no chat_id/notes columns
@@ -363,3 +380,67 @@ def mark_friend_rec_consumed(rec_id: int):
             SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP
             WHERE id = ?
         """, (rec_id,))
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenant token + settings storage
+# ---------------------------------------------------------------------------
+
+def set_tenant_tokens(chat_id: int, tokens: dict | None, client_info: dict | None):
+    """Upsert OAuth tokens + dynamic-registration client info for one chat."""
+    with conn() as c:
+        c.execute("""
+            INSERT INTO tenant_tokens (chat_id, tokens_json, client_info_json, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                tokens_json = excluded.tokens_json,
+                client_info_json = excluded.client_info_json,
+                updated_at = CURRENT_TIMESTAMP
+        """, (
+            chat_id,
+            json.dumps(tokens) if tokens is not None else None,
+            json.dumps(client_info) if client_info is not None else None,
+        ))
+
+
+def get_tenant_tokens(chat_id: int) -> tuple[dict | None, dict | None]:
+    """Return (tokens, client_info) parsed from the row, or (None, None)."""
+    with conn() as c:
+        row = c.execute("""
+            SELECT tokens_json, client_info_json
+            FROM tenant_tokens WHERE chat_id = ?
+        """, (chat_id,)).fetchone()
+    if not row:
+        return None, None
+    tokens = json.loads(row["tokens_json"]) if row["tokens_json"] else None
+    client_info = json.loads(row["client_info_json"]) if row["client_info_json"] else None
+    return tokens, client_info
+
+
+def has_tenant_tokens(chat_id: int) -> bool:
+    tokens, _ = get_tenant_tokens(chat_id)
+    return bool(tokens and tokens.get("access_token"))
+
+
+def set_default_address(chat_id: int, address_id: str):
+    with conn() as c:
+        c.execute("""
+            INSERT INTO tenant_settings (chat_id, default_address_id, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                default_address_id = excluded.default_address_id,
+                updated_at = CURRENT_TIMESTAMP
+        """, (chat_id, address_id))
+
+
+def get_default_address(chat_id: int) -> str | None:
+    """Per-chat default delivery address. Falls back to the legacy
+    SWIGGY_DEFAULT_ADDRESS_ID env var so existing single-tenant Railway
+    deployments keep working without manual data migration."""
+    with conn() as c:
+        row = c.execute("""
+            SELECT default_address_id FROM tenant_settings WHERE chat_id = ?
+        """, (chat_id,)).fetchone()
+    if row and row["default_address_id"]:
+        return row["default_address_id"]
+    return os.getenv("SWIGGY_DEFAULT_ADDRESS_ID") or None

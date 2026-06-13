@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 from datetime import time as dt_time, timezone, timedelta
 from dotenv import load_dotenv
@@ -8,8 +9,10 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 import db
 import onboarding
+import tenant_setup
 import llm
 import swiggy_mcp
+from swiggy_login import FileTokenStorage, TOKENS_FILE
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -22,7 +25,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SWIGGY_DEFAULT_ADDRESS_ID = os.getenv("SWIGGY_DEFAULT_ADDRESS_ID")
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -113,15 +115,20 @@ def _render_staples(payload: dict) -> str:
 
 
 async def staples(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show Instamart go-to items for the default address."""
-    if not SWIGGY_DEFAULT_ADDRESS_ID:
-        await update.message.reply_text("SWIGGY_DEFAULT_ADDRESS_ID isn't set. Add it to .env.")
+    """Show Instamart go-to items for this household's default address."""
+    chat_id = update.effective_chat.id
+    address_id = db.get_default_address(chat_id)
+    if not address_id:
+        await update.message.reply_text(
+            "No delivery address set for this household yet. Run /set_address."
+        )
         return
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         payload = await swiggy_mcp.call_tool(
+            chat_id,
             "your_go_to_items",
-            {"addressId": SWIGGY_DEFAULT_ADDRESS_ID},
+            {"addressId": address_id},
         )
         logger.info(f"your_go_to_items raw payload: {payload}")
         await update.message.reply_text(_render_staples(payload))
@@ -236,14 +243,62 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"(Remy hit an error: {e})")
 
 
+def _migrate_legacy_tenant() -> None:
+    """One-time migration of single-tenant env-var state into the per-chat tables.
+
+    If LEGACY_CHAT_ID env var is set and that chat has no tenant_tokens row,
+    move the contents of the legacy tokens file (which FileTokenStorage's init
+    will seed from SWIGGY_TOKENS_JSON if needed) into tenant_tokens, and copy
+    SWIGGY_DEFAULT_ADDRESS_ID into tenant_settings. Idempotent — safe to run
+    on every boot. Once a tenant has its own DB row, this no-ops."""
+    legacy_id_raw = os.getenv("LEGACY_CHAT_ID")
+    if not legacy_id_raw:
+        return
+    try:
+        chat_id = int(legacy_id_raw)
+    except ValueError:
+        logger.warning(f"LEGACY_CHAT_ID is not a valid integer: {legacy_id_raw!r}")
+        return
+
+    if db.has_tenant_tokens(chat_id):
+        return
+
+    # Trigger any SWIGGY_TOKENS_JSON -> file seed before reading
+    FileTokenStorage(TOKENS_FILE)
+    if not TOKENS_FILE.exists():
+        logger.info(f"_migrate_legacy_tenant: no tokens file at {TOKENS_FILE}, skipping")
+        return
+    try:
+        data = json.loads(TOKENS_FILE.read_text())
+    except Exception as e:
+        logger.warning(f"_migrate_legacy_tenant: couldn't read tokens file: {e}")
+        return
+
+    tokens = data.get("tokens")
+    if not tokens or not tokens.get("access_token"):
+        logger.warning("_migrate_legacy_tenant: legacy file has no usable tokens")
+        return
+
+    db.set_tenant_tokens(chat_id, tokens, data.get("client_info"))
+    logger.info(f"_migrate_legacy_tenant: tokens migrated for chat_id={chat_id}")
+
+    default_addr = os.getenv("SWIGGY_DEFAULT_ADDRESS_ID")
+    if default_addr:
+        db.set_default_address(chat_id, default_addr)
+        logger.info(f"_migrate_legacy_tenant: default address {default_addr} set for chat_id={chat_id}")
+
+
 def build_app() -> Application:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set in environment")
 
     db.init_db()
+    _migrate_legacy_tenant()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(onboarding.build_handler())
+    app.add_handler(tenant_setup.build_import_handler())
+    app.add_handler(tenant_setup.build_set_address_handler())
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("plan", plan_command))

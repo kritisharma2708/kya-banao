@@ -1,14 +1,13 @@
-"""Swiggy Instamart MCP client used by the bot.
+"""Swiggy Instamart MCP client used by the bot — multi-tenant.
 
-Loads tokens written by swiggy_login.py and exposes a thin call_tool()
-wrapper. Auto-refresh writes updated tokens back to the same file, so
-copying .swiggy_tokens.json to the server is the only manual step after
-the one-time login.
+Each call is scoped to a chat_id so tokens are looked up per household from
+the tenant_tokens table. Backward-compat path: if a chat_id is None, fall
+back to the legacy single-tenant FileTokenStorage so the older single-tenant
+Railway deployment and the standalone __main__ smoke test keep working
+during the multi-tenant migration.
 
-If tokens are missing or refresh fails, callers see a clear error —
-re-running swiggy_login.py on the laptop is the remedy. Browser-based
-OAuth cannot run from Railway, so the redirect/callback handlers here
-raise loudly if invoked.
+Browser-based OAuth cannot run from Railway, so the redirect/callback
+handlers raise loudly if invoked — re-auth is always done on a laptop.
 """
 
 from __future__ import annotations
@@ -21,17 +20,24 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.auth import OAuthClientMetadata
 
-from swiggy_login import REDIRECT_URI, SWIGGY_MCP_URL, TOKENS_FILE, FileTokenStorage
+import db
+from swiggy_login import (
+    REDIRECT_URI,
+    SWIGGY_MCP_URL,
+    TOKENS_FILE,
+    DBTokenStorage,
+    FileTokenStorage,
+)
 
 
 class SwiggyAuthRequired(RuntimeError):
-    """Raised when tokens are missing or unusable. Re-run swiggy_login.py."""
+    """Raised when tokens are missing or unusable for the given chat."""
 
 
 async def _no_redirect(_authorization_url: str) -> None:
     raise SwiggyAuthRequired(
-        "Swiggy OAuth needs a browser. Run `python swiggy_login.py` on your "
-        "laptop, then copy .swiggy_tokens.json to the server."
+        "Swiggy OAuth needs a browser. Run `python swiggy_login.py` on a "
+        "laptop, then paste the resulting JSON via /import_tokens."
     )
 
 
@@ -39,18 +45,25 @@ async def _no_callback() -> tuple[str, str | None]:
     raise SwiggyAuthRequired("Swiggy OAuth callback cannot run server-side.")
 
 
-def _build_auth() -> OAuthClientProvider:
-    storage = FileTokenStorage(TOKENS_FILE)
-    client_metadata = OAuthClientMetadata(
-        client_name="Kya Banao",
-        redirect_uris=[REDIRECT_URI],
-        grant_types=["authorization_code", "refresh_token"],
-        response_types=["code"],
-        token_endpoint_auth_method="none",
-    )
+_CLIENT_METADATA = OAuthClientMetadata(
+    client_name="Kya Banao",
+    redirect_uris=[REDIRECT_URI],
+    grant_types=["authorization_code", "refresh_token"],
+    response_types=["code"],
+    token_endpoint_auth_method="none",
+)
+
+
+def _build_auth(chat_id: int | None) -> OAuthClientProvider:
+    """Per-chat auth provider. chat_id=None routes through the legacy
+    FileTokenStorage so single-tenant fallback continues to work."""
+    if chat_id is None:
+        storage = FileTokenStorage(TOKENS_FILE)
+    else:
+        storage = DBTokenStorage(chat_id)
     return OAuthClientProvider(
         server_url=SWIGGY_MCP_URL,
-        client_metadata=client_metadata,
+        client_metadata=_CLIENT_METADATA,
         storage=storage,
         redirect_handler=_no_redirect,
         callback_handler=_no_callback,
@@ -61,9 +74,8 @@ def _unwrap(result: Any) -> dict[str, Any]:
     """Normalize MCP responses into {success: bool, data?: dict, error?: dict}.
 
     Swiggy changed their response format around 2026-05-26: structured payloads
-    now live in `result.structuredContent` (proper MCP structured output) and
-    `content[0].text` is a human-readable summary. Old code parsed text as JSON
-    which now blows up. Order of preference:
+    now live in `result.structuredContent` and `content[0].text` is a human-
+    readable summary. Order of preference:
       1) isError=True -> synthesize error envelope from the text summary.
       2) structuredContent present -> wrap as {success, data} for caller compat.
       3) Legacy JSON-in-text -> parse and return as-is.
@@ -88,15 +100,27 @@ def _unwrap(result: Any) -> dict[str, Any]:
     raise RuntimeError(f"Unexpected MCP result shape: {result}")
 
 
-async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Call an Instamart MCP tool and return the unwrapped Swiggy payload."""
-    # Build auth first — FileTokenStorage's init runs the Railway env-var
-    # bootstrap, which may create the tokens file from SWIGGY_TOKENS_JSON.
-    # Only then check whether tokens actually exist on disk.
-    auth = _build_auth()
-    if not TOKENS_FILE.exists():
+def _tokens_present(chat_id: int | None) -> bool:
+    if chat_id is None:
+        return TOKENS_FILE.exists()
+    return db.has_tenant_tokens(chat_id)
+
+
+async def call_tool(
+    chat_id: int | None,
+    name: str,
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Call an Instamart MCP tool on behalf of one chat (household).
+
+    Pass chat_id=None only for legacy single-tenant flows (the standalone
+    __main__ smoke test, the swiggy_mcp script). Production callers always
+    have a chat_id."""
+    auth = _build_auth(chat_id)
+    if not _tokens_present(chat_id):
         raise SwiggyAuthRequired(
-            f"No tokens at {TOKENS_FILE}. Run `python swiggy_login.py` first."
+            f"No Swiggy tokens for chat {chat_id}. Run `python swiggy_login.py` "
+            "on a laptop and paste the resulting JSON here via /import_tokens."
         )
 
     async with streamablehttp_client(SWIGGY_MCP_URL, auth=auth) as (read, write, _):
@@ -106,9 +130,9 @@ async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[
             return _unwrap(result)
 
 
-async def list_tools() -> list[Any]:
-    """Discover available Instamart tools (debug helper)."""
-    auth = _build_auth()
+async def list_tools(chat_id: int | None = None) -> list[Any]:
+    """Discover available Instamart tools. Mostly used as a debug helper."""
+    auth = _build_auth(chat_id)
     async with streamablehttp_client(SWIGGY_MCP_URL, auth=auth) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -120,13 +144,14 @@ if __name__ == "__main__":
     import asyncio
 
     async def _smoke():
-        tools = await list_tools()
+        # Single-tenant path: uses local .swiggy_tokens.json
+        tools = await list_tools(chat_id=None)
         print(f"{len(tools)} tools available:")
         for t in tools:
             print(f"  - {t.name}: {t.description[:80] if t.description else ''}")
         print()
         print("Calling get_addresses ...")
-        payload = await call_tool("get_addresses")
+        payload = await call_tool(None, "get_addresses")
         print(json.dumps(payload, indent=2))
 
     asyncio.run(_smoke())

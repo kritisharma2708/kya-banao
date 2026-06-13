@@ -89,6 +89,35 @@ class FileTokenStorage(TokenStorage):
         self._write(data)
 
 
+class DBTokenStorage(TokenStorage):
+    """Multi-tenant token storage: tokens live in the SQLite tenant_tokens
+    table keyed by chat_id. Used by the running bot to serve many households
+    from a single deployment."""
+
+    def __init__(self, chat_id: int):
+        # Imported here to keep the swiggy_login module usable as a standalone
+        # CLI script that doesn't touch the bot's DB.
+        import db  # noqa: PLC0415
+        self.chat_id = chat_id
+        self._db = db
+
+    async def get_tokens(self) -> OAuthToken | None:
+        tokens, _ = self._db.get_tenant_tokens(self.chat_id)
+        return OAuthToken(**tokens) if tokens else None
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        _, client_info = self._db.get_tenant_tokens(self.chat_id)
+        self._db.set_tenant_tokens(self.chat_id, tokens.model_dump(mode="json"), client_info)
+
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
+        _, client_info = self._db.get_tenant_tokens(self.chat_id)
+        return OAuthClientInformationFull(**client_info) if client_info else None
+
+    async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
+        tokens, _ = self._db.get_tenant_tokens(self.chat_id)
+        self._db.set_tenant_tokens(self.chat_id, tokens, client_info.model_dump(mode="json"))
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
     captured: dict = {}
 
