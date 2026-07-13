@@ -131,7 +131,39 @@ def init_db():
                 default_address_id TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- Look-ahead prep: curated rules mapping dish-name substrings to
+            -- lead-time prep actions (soak, marinate, ferment, thaw).
+            -- lead = 'night_before' (nudged by the 9 PM cron for tomorrow's
+            -- meals) or 'same_day_morning' (woven into the morning brief for
+            -- today's meals).
+            CREATE TABLE IF NOT EXISTS prep_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern TEXT NOT NULL UNIQUE,
+                action TEXT NOT NULL,
+                lead TEXT NOT NULL DEFAULT 'night_before',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Look-ahead prep: state per nudge, so the morning brief stays
+            -- consistent with what actually happened the night before.
+            -- status: 'nudged' (sent, no reply) | 'confirmed' | 'missed'.
+            CREATE TABLE IF NOT EXISTS prep_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                meal_date DATE NOT NULL,
+                meal_type TEXT,
+                dish TEXT NOT NULL,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'nudged',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prep_state_chat_date
+                ON prep_state(chat_id, meal_date);
         """)
+        _seed_prep_rules(c)
 
         # Migrations: cook_events originally had no chat_id/notes columns
         cols = {row[1] for row in c.execute("PRAGMA table_info(cook_events)").fetchall()}
@@ -139,6 +171,38 @@ def init_db():
             c.execute("ALTER TABLE cook_events ADD COLUMN chat_id INTEGER")
         if "notes" not in cols:
             c.execute("ALTER TABLE cook_events ADD COLUMN notes TEXT")
+
+
+# Curated lead-time prep knowledge for common Indian dishes. Patterns are
+# lowercase substrings matched against planned dish names. Editable in the DB
+# after seeding; this list only populates an empty table.
+DEFAULT_PREP_RULES = [
+    ("rajma", "Soak the rajma tonight, it wants a good 8 hours in water", "night_before"),
+    ("chole", "Soak the chole tonight, overnight in plenty of water", "night_before"),
+    ("chana masala", "Soak the chana tonight, overnight in plenty of water", "night_before"),
+    ("chickpea", "Soak the chickpeas tonight, overnight in plenty of water", "night_before"),
+    ("dal makhani", "Soak the whole urad (and rajma if the recipe uses it) tonight", "night_before"),
+    ("whole urad", "Soak the whole urad tonight", "night_before"),
+    ("sabudana", "Soak the sabudana tonight, water just level with the pearls", "night_before"),
+    ("dosa", "If the batter is homemade it should already be fermenting; soak rice and urad tonight only if you're starting fresh batter for later this week", "night_before"),
+    ("idli", "If the batter is homemade it should already be fermenting; store-bought batter needs nothing", "night_before"),
+    ("dhokla", "If making dhokla from scratch, the batter wants souring overnight", "night_before"),
+    ("sprout", "Sprouts need a head start: soak tonight, then a day in a damp cloth", "night_before"),
+    ("kadhi", "Kadhi wants sour curd, check there's curd out and souring tonight", "night_before"),
+    ("tikka", "Get the marinade on by noon, it wants 3 to 4 hours", "same_day_morning"),
+    ("tandoori", "Get the marinade on by noon, it wants 3 to 4 hours", "same_day_morning"),
+    ("frozen", "Move it from freezer to fridge in the morning so it's thawed by cooking time", "same_day_morning"),
+]
+
+
+def _seed_prep_rules(c):
+    """Populate prep_rules with the curated defaults, once. INSERT OR IGNORE
+    keyed on the UNIQUE pattern, so re-running init_db never duplicates and
+    never overwrites a rule Kriti has edited in place."""
+    c.executemany(
+        "INSERT OR IGNORE INTO prep_rules (pattern, action, lead) VALUES (?, ?, ?)",
+        DEFAULT_PREP_RULES,
+    )
 
 
 def upsert_user(user_id: int, name: str, chat_id: int):
@@ -380,6 +444,66 @@ def mark_friend_rec_consumed(rec_id: int):
             SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP
             WHERE id = ?
         """, (rec_id,))
+
+
+# ---------------------------------------------------------------------------
+# Look-ahead prep: rules + per-nudge state
+# ---------------------------------------------------------------------------
+
+def get_prep_rules() -> list[dict]:
+    with conn() as c:
+        rows = c.execute(
+            "SELECT pattern, action, lead FROM prep_rules ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def record_prep_nudges(chat_id: int, meal_date: str, preps: list[dict]):
+    """Insert prep_state rows for tonight's nudge. Skips any (dish, date) pair
+    that already has a row, so a manually re-run cron never double-records."""
+    with conn() as c:
+        for p in preps:
+            existing = c.execute("""
+                SELECT id FROM prep_state
+                WHERE chat_id = ? AND meal_date = ? AND dish = ?
+            """, (chat_id, meal_date, p["dish"])).fetchone()
+            if existing:
+                continue
+            c.execute("""
+                INSERT INTO prep_state (chat_id, meal_date, meal_type, dish, action)
+                VALUES (?, ?, ?, ?, ?)
+            """, (chat_id, meal_date, p.get("meal_type"), p["dish"], p["action"]))
+
+
+def get_prep_state(chat_id: int, meal_date: str) -> list[dict]:
+    """All prep rows for dishes planned on meal_date (nudged the night before)."""
+    with conn() as c:
+        rows = c.execute("""
+            SELECT meal_type, dish, action, status
+            FROM prep_state
+            WHERE chat_id = ? AND meal_date = ?
+            ORDER BY id
+        """, (chat_id, meal_date)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_prep_status(chat_id: int, meal_date: str, status: str, dish_hint: str = "") -> int:
+    """Mark prep as confirmed/missed. dish_hint narrows to one dish (substring
+    match); empty hint updates every prep row for that date. Returns rows hit."""
+    with conn() as c:
+        if dish_hint:
+            cur = c.execute("""
+                UPDATE prep_state
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ? AND meal_date = ? AND LOWER(dish) LIKE ?
+            """, (status, chat_id, meal_date, f"%{dish_hint.lower()}%"))
+        else:
+            cur = c.execute("""
+                UPDATE prep_state
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ? AND meal_date = ?
+            """, (status, chat_id, meal_date))
+        return cur.rowcount
 
 
 # ---------------------------------------------------------------------------

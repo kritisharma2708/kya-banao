@@ -69,6 +69,40 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"(Couldn't generate plan: {e})")
 
 
+async def prep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual trigger: run tonight's prep look-ahead for this chat on demand."""
+    chat = update.effective_chat
+    try:
+        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+        nudge = await llm.check_prep_for_chat(chat.id)
+        if not nudge:
+            await update.message.reply_text(
+                "(Nothing on tomorrow's plan needs a head start tonight. Or there's no plan covering tomorrow.)"
+            )
+            return
+        await update.message.reply_text(nudge)
+        db.save_message(chat.id, "assistant", nudge, user_name=None)
+    except Exception as e:
+        logger.exception("Prep look-ahead error")
+        await update.message.reply_text(f"(Prep check hit an error: {e})")
+
+
+async def brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual trigger: generate this morning's brief for this chat on demand."""
+    chat = update.effective_chat
+    try:
+        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+        brief = await llm.generate_morning_brief(chat.id)
+        if not brief:
+            await update.message.reply_text("(No weekly plan covers today, so there's no brief to give.)")
+            return
+        await update.message.reply_text(brief)
+        db.save_message(chat.id, "assistant", brief, user_name=None)
+    except Exception as e:
+        logger.exception("Morning brief error")
+        await update.message.reply_text(f"(Brief hit an error: {e})")
+
+
 async def discovery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual trigger: generate this week's discovery nudge on demand."""
     chat = update.effective_chat
@@ -153,19 +187,37 @@ async def send_weekly_plan(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_daily_menu(context: ContextTypes.DEFAULT_TYPE):
-    """Daily 8 AM IST cron: post today's planned meals to each household chat.
-    Silent if no weekly plan covers today (e.g., last Sunday's plan expired)."""
+    """Daily 8 AM IST cron: post the morning brief — today as a decided day,
+    consistent with last night's prep state. Silent if no weekly plan covers
+    today (e.g., last Sunday's plan expired)."""
     chat_ids = db.get_chat_ids_with_onboarded_users()
-    logger.info(f"Daily menu firing for {len(chat_ids)} chat(s)")
+    logger.info(f"Morning brief firing for {len(chat_ids)} chat(s)")
     for chat_id in chat_ids:
         try:
-            reminder = await llm.format_daily_menu_for_chat(chat_id)
-            if not reminder:
+            brief = await llm.generate_morning_brief(chat_id)
+            if not brief:
                 continue
-            await context.bot.send_message(chat_id=chat_id, text=reminder)
-            db.save_message(chat_id, "assistant", reminder, user_name=None)
+            await context.bot.send_message(chat_id=chat_id, text=brief)
+            db.save_message(chat_id, "assistant", brief, user_name=None)
         except Exception as e:
-            logger.exception(f"Daily menu failed for {chat_id}: {e}")
+            logger.exception(f"Morning brief failed for {chat_id}: {e}")
+
+
+async def send_prep_lookahead(context: ContextTypes.DEFAULT_TYPE):
+    """Daily 9 PM IST cron: check tomorrow's plan for overnight prep (soaking,
+    fermenting, marinating) and nudge tonight. Silent when nothing needs a
+    head start."""
+    chat_ids = db.get_chat_ids_with_onboarded_users()
+    logger.info(f"Prep look-ahead firing for {len(chat_ids)} chat(s)")
+    for chat_id in chat_ids:
+        try:
+            nudge = await llm.check_prep_for_chat(chat_id)
+            if not nudge:
+                continue
+            await context.bot.send_message(chat_id=chat_id, text=nudge)
+            db.save_message(chat_id, "assistant", nudge, user_name=None)
+        except Exception as e:
+            logger.exception(f"Prep look-ahead failed for {chat_id}: {e}")
 
 
 async def send_weekly_discovery(context: ContextTypes.DEFAULT_TYPE):
@@ -302,6 +354,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("plan", plan_command))
+    app.add_handler(CommandHandler("prep", prep_command))
+    app.add_handler(CommandHandler("brief", brief_command))
     app.add_handler(CommandHandler("discovery", discovery_command))
     app.add_handler(CommandHandler("staples", staples))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
@@ -330,6 +384,14 @@ def build_app() -> Application:
         name="cadence_nudge",
     )
     logger.info("Scheduled cadence_nudge cron for daily 09:00 IST")
+
+    # Daily 9 PM IST prep look-ahead — soak/marinate/ferment for tomorrow's plan
+    app.job_queue.run_daily(
+        callback=send_prep_lookahead,
+        time=dt_time(hour=21, minute=0, tzinfo=IST),
+        name="prep_lookahead",
+    )
+    logger.info("Scheduled prep_lookahead cron for daily 21:00 IST")
 
     # Wednesday 7 PM IST discovery nudge — one novel suggestion mid-week
     app.job_queue.run_daily(

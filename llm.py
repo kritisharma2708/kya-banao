@@ -105,6 +105,37 @@ TOOLS = [
         },
     },
     {
+        "name": "update_prep_status",
+        "description": (
+            "Record whether a lead-time prep step (soaking, marinating, fermenting, thawing) actually happened. "
+            "Call this when the user says they did it ('soaked the rajma', 'batter's fermenting', 'done') or "
+            "didn't ('forgot to soak', 'oops, never did it'). The morning brief reads this state to stay "
+            "consistent: confirmed prep means the dish goes ahead, missed prep means Remy re-plans around it. "
+            "meal_date is the day the DISH is planned for, not the day the prep happens. A 'soaked it' reply "
+            "at night refers to tomorrow's dish; 'forgot to soak' in the morning refers to today's dish. "
+            "If the reply is about one specific dish, pass a short dish_hint (e.g. 'rajma')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "meal_date": {
+                    "type": "string",
+                    "description": "ISO YYYY-MM-DD date the dish is planned for.",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["confirmed", "missed"],
+                    "description": "confirmed = prep was done, missed = prep didn't happen.",
+                },
+                "dish_hint": {
+                    "type": "string",
+                    "description": "Short substring identifying the dish ('rajma', 'tikka'). Empty string if the reply covers all pending prep for that date.",
+                },
+            },
+            "required": ["meal_date", "status"],
+        },
+    },
+    {
         "name": "instamart_go_to_items",
         "description": (
             "Fetch the household's frequent/recent Instamart purchases (curd, paneer, snacks, staples). "
@@ -278,6 +309,23 @@ async def _execute_tool_inner(chat_id: int, name: str, args: dict) -> str:
             return f"Queued rec from {who}: {args['item']}"
         except Exception as e:
             return f"Failed to save recommendation: {e}"
+    if name == "update_prep_status":
+        try:
+            hit = db.set_prep_status(
+                chat_id,
+                args["meal_date"],
+                args["status"],
+                args.get("dish_hint", ""),
+            )
+            if hit == 0:
+                return (
+                    f"No prep is tracked for {args['meal_date']}"
+                    + (f" matching '{args['dish_hint']}'" if args.get("dish_hint") else "")
+                    + ". Nothing recorded. Don't pretend it was."
+                )
+            return f"Recorded: {hit} prep item(s) for {args['meal_date']} marked {args['status']}."
+        except Exception as e:
+            return f"Failed to update prep status: {e}"
     if name == "instamart_go_to_items":
         try:
             address_id = db.get_default_address(chat_id)
@@ -730,24 +778,182 @@ async def generate_weekly_plan(chat_id: int) -> str:
     return voiced
 
 
-async def format_daily_menu_for_chat(chat_id: int, today: date | None = None) -> str | None:
-    """Look up today's meals from the latest weekly plan and return a short
-    reminder in Remy's voice. Returns None if no plan covers today (cron
-    stays silent)."""
+# -----------------------------------------------------------------------------
+# Look-ahead prep: detect lead-time steps (soak/marinate/ferment/thaw) in
+# planned dishes, nudge the night before, and keep the morning brief honest
+# about what actually got done.
+# -----------------------------------------------------------------------------
+
+def _detect_prep_from_rules(
+    meals: dict, rules: list[dict], lead: str
+) -> tuple[list[dict], list[dict]]:
+    """Match planned dishes against curated prep_rules for one lead class.
+    Returns (matched preps, unmatched dishes) — unmatched go to the LLM
+    fallback. First matching rule per dish wins."""
+    matched: list[dict] = []
+    unmatched: list[dict] = []
+    for meal_type in ("breakfast", "lunch", "dinner"):
+        dish = (meals.get(meal_type) or "").strip()
+        if not dish:
+            continue
+        dish_lower = dish.lower()
+        hit = None
+        for r in rules:
+            if r["lead"] == lead and r["pattern"] in dish_lower:
+                hit = r
+                break
+        if hit:
+            matched.append({"meal_type": meal_type, "dish": dish, "action": hit["action"]})
+        else:
+            unmatched.append({"meal_type": meal_type, "dish": dish})
+    return matched, unmatched
+
+
+PREP_FALLBACK_INSTRUCTION = """You are checking tomorrow's planned dishes for OVERNIGHT lead-time prep that must start tonight: soaking dried beans/lentils/sago, fermenting batter, setting or souring curd, long marination. Ignore anything that can be done day-of (chopping, quick 30-minute marinades, boiling).
+
+Dishes (JSON): """
+
+PREP_FALLBACK_SUFFIX = """
+
+Reply with ONLY a JSON array, no prose. One entry per dish that genuinely needs overnight prep, empty array if none:
+[{"meal_type": "...", "dish": "...", "action": "one short imperative sentence saying what to do tonight"}]
+
+Be conservative. When unsure whether a dish needs overnight prep, leave it out. A false nudge erodes trust faster than a missed one."""
+
+
+async def _detect_prep_llm(unmatched: list[dict]) -> list[dict]:
+    """LLM fallback for dishes the curated rules didn't recognize. Conservative
+    by instruction; any parse failure returns [] rather than guessing."""
+    if not unmatched:
+        return []
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=512,
+        messages=[{
+            "role": "user",
+            "content": PREP_FALLBACK_INSTRUCTION
+            + json.dumps(unmatched, ensure_ascii=False)
+            + PREP_FALLBACK_SUFFIX,
+        }],
+    )
+    raw = "".join(b.text for b in response.content if b.type == "text").strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        preps = json.loads(raw)
+        return [
+            p for p in preps
+            if isinstance(p, dict) and p.get("dish") and p.get("action")
+        ]
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(f"prep fallback returned unparseable output: {raw[:200]}")
+        return []
+
+
+PREP_NUDGE_INSTRUCTION = """It's evening. Tomorrow's plan includes dishes that need prep starting TONIGHT. Compose ONE short message in Remy's voice (3 sentences max) telling the household what to do before bed. Name the dish and the action concretely ("soak the rajma before you sleep, tomorrow's lunch depends on it"). If there are multiple preps, weave them into one flowing message, don't list them.
+
+Close by asking them to say the word once it's done, so you know the dish is safe for tomorrow.
+
+Hard rules:
+- NO em-dashes, NO markdown asterisks, NO bullet hyphens.
+- Stay in Remy's sensory, specific voice.
+- Do not mention anything about tomorrow's plan beyond the prep-dependent dishes.
+
+Prep needed tonight (JSON):
+"""
+
+
+async def check_prep_for_chat(chat_id: int, today: date | None = None) -> str | None:
+    """9 PM cron body: look at TOMORROW's planned meals, detect overnight prep
+    (curated rules first, conservative LLM fallback for unknown dishes), record
+    prep_state, and return a voiced nudge. None = nothing needs prep tonight
+    (cron stays silent)."""
+    today = today or date.today()
+    tomorrow = today + timedelta(days=1)
+    meals = db.get_meals_for_date(chat_id, tomorrow.isoformat())
+    if not meals:
+        return None
+
+    rules = db.get_prep_rules()
+    matched, unmatched = _detect_prep_from_rules(meals, rules, lead="night_before")
+    try:
+        matched += await _detect_prep_llm(unmatched)
+    except Exception:
+        logger.exception("prep: LLM fallback failed, continuing with rule matches only")
+    if not matched:
+        return None
+
+    db.record_prep_nudges(chat_id, tomorrow.isoformat(), matched)
+
+    household_context = build_household_context(chat_id)
+    instruction = PREP_NUDGE_INSTRUCTION + json.dumps(matched, ensure_ascii=False)
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=512,
+        system=[
+            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": household_context},
+        ],
+        messages=[{"role": "user", "content": instruction}],
+    )
+    raw = "".join(b.text for b in response.content if b.type == "text").strip()
+    return _strip_formatting(raw)
+
+
+MORNING_BRIEF_INSTRUCTION = """It's 8 AM. Compose today's brief in Remy's voice: a DECIDED day, not a menu of options. State breakfast, lunch, and dinner as settled facts, with at least one line of reasoning drawn from the real data below (cook's schedule, prep state, what the plan says). Never invent facts you don't have: no weather, no calendar events, nothing outside the JSON below and your context.
+
+Prep-state rules (these keep you honest, follow them exactly):
+- A dish whose prep is "confirmed": state it with full confidence, maybe a nod to the prep ("the rajma had its overnight swim, lunch is on").
+- A dish whose prep is "missed": the dish CANNOT happen today. Re-plan it out loud: name a no-prep alternative for that meal today, move the original dish to tomorrow, and tell them tonight's soak makes it happen. Do not guilt-trip, one light touch at most.
+- A dish whose prep is "nudged" (you asked last night, nobody answered): go with the plan, but add ONE conditional line: if the prep didn't happen, say the word and you'll pivot to [name a concrete no-prep alternative].
+- same_day_preps listed below are things to start THIS MORNING for today's meals (marinades, thawing). Weave them in with their timing ("get the tikka into its marinade by noon").
+
+Hard rules:
+- NO em-dashes, NO markdown asterisks, NO bullet hyphens at line starts.
+- Any alternative dish you name must respect the DIETARY CONSTRAINTS block in your context.
+- 4 to 7 short lines total. One thought per line. No headers.
+- Stay in Remy's sensory, specific voice.
+
+Today's data (JSON):
+"""
+
+
+async def generate_morning_brief(chat_id: int, today: date | None = None) -> str | None:
+    """8 AM cron body: today's meals as a decided day, consistent with last
+    night's prep state. Returns None if no plan covers today (cron stays
+    silent)."""
     today = today or date.today()
     meals = db.get_meals_for_date(chat_id, today.isoformat())
     if not meals:
         return None
-    day_name = today.strftime("%A")
-    b = meals.get("breakfast") or "(open)"
-    l = meals.get("lunch") or "(open)"
-    d = meals.get("dinner") or "(open)"
-    return (
-        f"Today on the plate, {day_name}.\n"
-        f"Breakfast: {b}.\n"
-        f"Lunch: {l}.\n"
-        f"Dinner: {d}."
+
+    prep_state = db.get_prep_state(chat_id, today.isoformat())
+    rules = db.get_prep_rules()
+    same_day_preps, _ = _detect_prep_from_rules(meals, rules, lead="same_day_morning")
+
+    payload = {
+        "today": today.isoformat(),
+        "day_name": today.strftime("%A"),
+        "meals": meals,
+        "prep_state": prep_state,
+        "same_day_preps": same_day_preps,
+    }
+
+    household_context = build_household_context(chat_id)
+    instruction = MORNING_BRIEF_INSTRUCTION + json.dumps(payload, ensure_ascii=False)
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=768,
+        system=[
+            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": household_context},
+        ],
+        messages=[{"role": "user", "content": instruction}],
     )
+    raw = "".join(b.text for b in response.content if b.type == "text").strip()
+    return _strip_formatting(raw)
 
 
 async def respond(chat_id: int, user_name: str, message: str) -> str:
