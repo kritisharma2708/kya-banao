@@ -5,7 +5,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean
-from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 import db
@@ -15,14 +15,64 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-client = AsyncAnthropic()
-MODEL = "claude-sonnet-4-6"
+# OpenRouter is OpenAI-compatible; DeepSeek Chat V3 is 20-50x cheaper than
+# Claude Sonnet 4.6 with comparable quality for our conversational + tool-use
+# workload. Model is env-overridable so we can experiment without a redeploy.
+client = AsyncOpenAI(
+    base_url=os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1"),
+    # Placeholder if unset so imports don't crash; calls fail with a clean
+    # auth error instead. Set OPENROUTER_API_KEY in .env / Railway vars.
+    api_key=os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "MISSING_API_KEY",
+    default_headers={
+        "HTTP-Referer": "https://github.com/kritisharma2708/kya-banao",
+        "X-Title": "Kya Banao (Remy)",
+    },
+)
+MODEL = os.getenv("REMY_MODEL", "deepseek/deepseek-chat")
 
 PROJECT_DIR = Path(__file__).parent
 SOUL = (PROJECT_DIR / "soul.md").read_text()
 USER_LORE = (PROJECT_DIR / "user.md").read_text()
 
 HISTORY_TURNS = 20
+
+
+def _openai_tools() -> list[dict]:
+    """Transform the internal TOOLS list (Anthropic-style `input_schema`) into
+    OpenAI's function-calling shape. Cheap to recompute; not memoized because
+    TOOLS is a module-level constant."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            },
+        }
+        for t in TOOLS
+    ]
+
+
+def _system_content(chat_id: int) -> str:
+    """One combined system prompt: soul + user lore + live household context."""
+    return "\n\n".join([SOUL, USER_LORE, build_household_context(chat_id)])
+
+
+async def _one_shot(system_texts: list[str], user_content: str, max_tokens: int = 2048) -> str:
+    """One-round LLM call (no tools). Used by the various cron / plan
+    generators. Joins system_texts into one system message per OpenAI shape."""
+    messages = [
+        {"role": "system", "content": "\n\n".join(t for t in system_texts if t)},
+        {"role": "user", "content": user_content},
+    ]
+    response = await client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        max_tokens=max_tokens,
+    )
+    return (response.choices[0].message.content or "").strip()
+
 
 TOOLS = [
     {
@@ -736,33 +786,25 @@ Meal plan text:
 async def _extract_structured_plan(plan_text: str) -> dict:
     """Second LLM pass: turn the voiced weekly plan into structured per-day JSON.
     Used to power the daily morning menu reminder."""
-    response = await client.messages.create(
-        model=MODEL,
+    raw = await _one_shot(
+        system_texts=[],  # extraction is pure parsing, doesn't need soul/lore
+        user_content=PLAN_EXTRACTION_INSTRUCTION + plan_text,
         max_tokens=1024,
-        messages=[{"role": "user", "content": PLAN_EXTRACTION_INSTRUCTION + plan_text}],
     )
-    raw = "".join(b.text for b in response.content if b.type == "text").strip()
-    # Strip code fences if Claude adds them despite the instruction
+    # Strip code fences if the model adds them despite the instruction
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
 
 
 async def generate_weekly_plan(chat_id: int) -> str:
-    household_context = build_household_context(chat_id)
     week_block, plan_start = _format_week_block()
     instruction = WEEKLY_PLAN_INSTRUCTION + "\n\n" + week_block
-    response = await client.messages.create(
-        model=MODEL,
+    raw = await _one_shot(
+        system_texts=[SOUL, USER_LORE, build_household_context(chat_id)],
+        user_content=instruction,
         max_tokens=2048,
-        system=[
-            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": household_context},
-        ],
-        messages=[{"role": "user", "content": instruction}],
     )
-    raw = "".join(b.text for b in response.content if b.type == "text").strip()
     voiced = _strip_formatting(raw)
 
     # Capture structured version for the daily menu reminder. If extraction
@@ -826,17 +868,13 @@ async def _detect_prep_llm(unmatched: list[dict]) -> list[dict]:
     by instruction; any parse failure returns [] rather than guessing."""
     if not unmatched:
         return []
-    response = await client.messages.create(
-        model=MODEL,
+    raw = await _one_shot(
+        system_texts=[],
+        user_content=PREP_FALLBACK_INSTRUCTION
+        + json.dumps(unmatched, ensure_ascii=False)
+        + PREP_FALLBACK_SUFFIX,
         max_tokens=512,
-        messages=[{
-            "role": "user",
-            "content": PREP_FALLBACK_INSTRUCTION
-            + json.dumps(unmatched, ensure_ascii=False)
-            + PREP_FALLBACK_SUFFIX,
-        }],
     )
-    raw = "".join(b.text for b in response.content if b.type == "text").strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     try:
@@ -885,19 +923,12 @@ async def check_prep_for_chat(chat_id: int, today: date | None = None) -> str | 
 
     db.record_prep_nudges(chat_id, tomorrow.isoformat(), matched)
 
-    household_context = build_household_context(chat_id)
     instruction = PREP_NUDGE_INSTRUCTION + json.dumps(matched, ensure_ascii=False)
-    response = await client.messages.create(
-        model=MODEL,
+    raw = await _one_shot(
+        system_texts=[SOUL, USER_LORE, build_household_context(chat_id)],
+        user_content=instruction,
         max_tokens=512,
-        system=[
-            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": household_context},
-        ],
-        messages=[{"role": "user", "content": instruction}],
     )
-    raw = "".join(b.text for b in response.content if b.type == "text").strip()
     return _strip_formatting(raw)
 
 
@@ -940,59 +971,71 @@ async def generate_morning_brief(chat_id: int, today: date | None = None) -> str
         "same_day_preps": same_day_preps,
     }
 
-    household_context = build_household_context(chat_id)
     instruction = MORNING_BRIEF_INSTRUCTION + json.dumps(payload, ensure_ascii=False)
-    response = await client.messages.create(
-        model=MODEL,
+    raw = await _one_shot(
+        system_texts=[SOUL, USER_LORE, build_household_context(chat_id)],
+        user_content=instruction,
         max_tokens=768,
-        system=[
-            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": household_context},
-        ],
-        messages=[{"role": "user", "content": instruction}],
     )
-    raw = "".join(b.text for b in response.content if b.type == "text").strip()
     return _strip_formatting(raw)
 
 
 async def respond(chat_id: int, user_name: str, message: str) -> str:
-    messages = _build_messages(chat_id, user_name, message)
+    conv = _build_messages(chat_id, user_name, message)
+    # OpenAI wants one flat messages list, system first
+    messages = [{"role": "system", "content": _system_content(chat_id)}] + conv
 
-    response = None
+    tools = _openai_tools()
+    reply_text = ""
+
     for _ in range(5):  # tool-use loop, max 5 iterations
-        household_context = build_household_context(chat_id)
-        response = await client.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=[
-                {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": household_context},
-            ],
-            tools=TOOLS,
-            messages=messages,
-        )
-        logger.info(f"stop_reason={response.stop_reason} content_blocks={[b.type for b in response.content]}")
+        # Refresh system in case a tool call mutated household context (e.g. `remember`).
+        messages[0] = {"role": "system", "content": _system_content(chat_id)}
 
-        if response.stop_reason != "tool_use":
+        response = await client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=tools,
+            max_tokens=2048,
+        )
+        msg = response.choices[0].message
+        finish_reason = response.choices[0].finish_reason
+        tool_calls = msg.tool_calls or []
+        logger.info(f"finish_reason={finish_reason} tool_calls={len(tool_calls)}")
+
+        reply_text = (msg.content or "").strip()
+
+        if finish_reason != "tool_calls" or not tool_calls:
             break
 
-        # Append assistant turn (with tool_use blocks) and tool results
-        messages.append({"role": "assistant", "content": [block.model_dump() for block in response.content]})
-
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                result = await execute_tool(chat_id, block.name, block.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                })
-        messages.append({"role": "user", "content": tool_results})
-
-    reply_text = "".join(b.text for b in response.content if b.type == "text").strip()
+        # Append assistant turn (with tool_calls) then one tool-role message per call
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ],
+        })
+        for tc in tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                args = {}
+                logger.warning(f"Tool {tc.function.name} sent malformed JSON args: {e}")
+            result = await execute_tool(chat_id, tc.function.name, args)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            })
 
     db.save_message(chat_id, "user", message, user_name=user_name)
     db.save_message(chat_id, "assistant", reply_text, user_name=None)
@@ -1091,19 +1134,12 @@ async def check_cadence_for_chat(chat_id: int) -> str | None:
     if not alerts:
         return None
 
-    household_context = build_household_context(chat_id)
     instruction = CADENCE_NUDGE_INSTRUCTION + json.dumps(alerts[:5], ensure_ascii=False)
-    response = await client.messages.create(
-        model=MODEL,
+    raw = await _one_shot(
+        system_texts=[SOUL, USER_LORE, build_household_context(chat_id)],
+        user_content=instruction,
         max_tokens=512,
-        system=[
-            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": household_context},
-        ],
-        messages=[{"role": "user", "content": instruction}],
     )
-    raw = "".join(b.text for b in response.content if b.type == "text").strip()
     return _strip_formatting(raw)
 
 
@@ -1160,20 +1196,12 @@ async def generate_weekly_discovery(chat_id: int) -> str | None:
         "last_two_weekly_plans": recent_plans,
     }
 
-    household_context = build_household_context(chat_id)
     instruction = DISCOVERY_INSTRUCTION + "\n\n" + json.dumps(payload, ensure_ascii=False, default=str)[:6000]
-
-    response = await client.messages.create(
-        model=MODEL,
+    raw = await _one_shot(
+        system_texts=[SOUL, USER_LORE, build_household_context(chat_id)],
+        user_content=instruction,
         max_tokens=512,
-        system=[
-            {"type": "text", "text": SOUL, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": USER_LORE, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": household_context},
-        ],
-        messages=[{"role": "user", "content": instruction}],
     )
-    raw = "".join(b.text for b in response.content if b.type == "text").strip()
     voiced = _strip_formatting(raw)
     if not voiced:
         return None
